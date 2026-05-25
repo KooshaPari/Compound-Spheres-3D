@@ -1,7 +1,7 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading.Tasks;
 using UnityEngine;
 
 namespace CompoundSpheres
@@ -72,11 +72,32 @@ namespace CompoundSpheres
         public static void SetBuffer<T>(this GraphicsBuffer Buffer, int Count, Func<int, T> function) where T : struct
         {
             T[] Array = new T[Count];
-            Parallel.For(0, Count, (int i) =>
+            for (int i = 0; i < Count; i++)
             {
                 Array[i] = function(i);
-            });
+            }
             Buffer.SetData(Array);
+        }
+        /// <summary>
+        /// Coroutine that fills a buffer in chunks across multiple frames.
+        /// Each frame processes up to <paramref name="chunkSize"/> elements,
+        /// then yields to keep the main thread responsive.
+        /// Call <paramref name="onComplete"/> when finished (or check the
+        /// coroutine's completion).
+        /// </summary>
+        public static IEnumerator SetBufferChunked<T>(this GraphicsBuffer Buffer, int Count, Func<int, T> function, int chunkSize = 4096, Action onComplete = null) where T : struct
+        {
+            T[] Array = new T[Count];
+            for (int i = 0; i < Count; i++)
+            {
+                Array[i] = function(i);
+                if (i > 0 && (i % chunkSize) == 0)
+                {
+                    yield return null;
+                }
+            }
+            Buffer.SetData(Array);
+            onComplete?.Invoke();
         }
         /// <summary>
         /// Updates a buffer
@@ -90,7 +111,10 @@ namespace CompoundSpheres
             sorted.Sort();
 
             T[] Array = new T[ToUpdate.Count];
-            Parallel.For(0, ToUpdate.Count, (int i) => Array[i] = Function(sorted[i]) );
+            for (int i = 0; i < ToUpdate.Count; i++)
+            {
+                Array[i] = Function(sorted[i]);
+            }
             int BufferSize = 1;
             int ArrayStart = 0;
             int startIndex = sorted[0];

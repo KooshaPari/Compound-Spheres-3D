@@ -46,6 +46,19 @@ namespace CompoundSpheres
             Size = Marshal.SizeOf<T>();
             this.getCustomData = getCustomData;
         }
+        /// <summary>
+        /// Legacy constructor accepting an explicit byte size (ignored — size
+        /// is computed via Marshal.SizeOf&lt;T&gt;()).
+        /// </summary>
+        /// <param name="Name">the name of this buffer in your custom shader</param>
+        /// <param name="BufferSize">ignored, kept for backward compatibility</param>
+        /// <param name="getCustomData">a function that returns your custom data for each sphere tile</param>
+        public CustomBufferData(string Name, int BufferSize, GetCustomData<T> getCustomData)
+        {
+            this.Name = Name;
+            Size = Marshal.SizeOf<T>();
+            this.getCustomData = getCustomData;
+        }
         /// <inheritdoc/>
         public IBuffer GetBuffer(SphereManager sphereManager)
         {
@@ -261,5 +274,14 @@ namespace CompoundSpheres
             CustomBuffers = Original.CustomBuffers;
             TextureArray = Original.TextureArray;
         }
+    }
+    /// <summary>
+    /// Thrown when the GPU does not meet minimum requirements
+    /// (instancing, compute shaders, indirect args).
+    /// </summary>
+    public class IncompatibleHardwareException : System.Exception
+    {
+        public IncompatibleHardwareException() : base("GPU does not support required features (instancing / compute / indirect args).") { }
+        public IncompatibleHardwareException(string message) : base(message) { }
     }
 }

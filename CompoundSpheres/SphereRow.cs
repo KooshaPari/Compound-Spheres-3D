@@ -57,6 +57,40 @@ namespace CompoundSpheres
         {
             Graphics.RenderMeshIndirect(_rp, SphereManager.SphereTileMesh, SphereManager.commandBuf, 1);
         }
+        /// <summary>
+        /// draw a contiguous sub-range of columns in this row.
+        /// colStart is the first column index, colCount is how many to draw.
+        /// The shader indexes as (Row + instance_id) so we shift Row by colStart
+        /// and set instanceCount to colCount.
+        /// </summary>
+        public void DrawTiles(int colStart, int colCount)
+        {
+            if (colCount <= 0) return;
+            if (colStart == 0 && colCount == Cols)
+            {
+                DrawTiles();
+                return;
+            }
+            Properties.SetInteger("Row", Row * Cols + colStart);
+            _rangeCommandData[0].indexCountPerInstance = SphereManager.SphereTileMesh.GetIndexCount(0);
+            _rangeCommandData[0].instanceCount = (uint)colCount;
+            _rangeCommandBuf.SetData(_rangeCommandData);
+            Graphics.RenderMeshIndirect(_rp, SphereManager.SphereTileMesh, _rangeCommandBuf, 1);
+            Properties.SetInteger("Row", Row * Cols);
+        }
+        internal void InitRangeBuffer()
+        {
+            _rangeCommandBuf = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1,
+                GraphicsBuffer.IndirectDrawIndexedArgs.size);
+            _rangeCommandData = new GraphicsBuffer.IndirectDrawIndexedArgs[1];
+        }
+        internal void ReleaseRangeBuffer()
+        {
+            _rangeCommandBuf?.Release();
+            _rangeCommandBuf = null;
+        }
+        private GraphicsBuffer _rangeCommandBuf;
+        private GraphicsBuffer.IndirectDrawIndexedArgs[] _rangeCommandData;
         private RenderParams _rp;
     }
 }

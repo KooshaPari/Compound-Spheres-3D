@@ -7,9 +7,15 @@
 	<AllowUnsafeBlocks>False</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <WorldBoxPath Condition="'$(WorldBoxPath)' == '' AND '$(WORLDBOX_PATH)' != ''">$(WORLDBOX_PATH)</WorldBoxPath>
+    <WorldBoxPath Condition="'$(WorldBoxPath)' == '' AND '$(OS)' == 'Windows_NT'">C:/Program Files (x86)/Steam/steamapps/common/worldbox</WorldBoxPath>
+    <WorldBoxManaged>$(WorldBoxPath)/worldbox_Data/Managed</WorldBoxManaged>
+  </PropertyGroup>
+
   <ItemGroup>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\worldbox\worldbox_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(WorldBoxManaged)/UnityEngine.CoreModule.dll</HintPath>
     </Reference>
   </ItemGroup>
 

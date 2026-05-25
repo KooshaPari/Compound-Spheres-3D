@@ -2,6 +2,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using System.Runtime.InteropServices;
 using UnityEngine;
 
@@ -58,6 +59,23 @@ namespace CompoundSpheres
         internal HashSet<int> _scales, _colors, _textures;
         private Dictionary<string, IBuffer> CustomBuffers;
         #endregion
+        #region FrustumCulling
+        /// <summary>
+        /// Frustum culler instance used to skip off-screen rows/columns.
+        /// </summary>
+        public readonly FrustumCuller Culler = new FrustumCuller();
+        /// <summary>
+        /// Enable or disable frustum culling. When disabled, all visible rows
+        /// draw every column (original behaviour).
+        /// </summary>
+        public bool FrustumCullingEnabled = true;
+        private Vector3 _tileHalfSize;
+        private int _lastCulledTiles;
+        /// <summary>
+        /// Number of tiles culled in the most recent DrawTiles call. Useful for profiling.
+        /// </summary>
+        public int LastCulledTiles => _lastCulledTiles;
+        #endregion
         #region Settings
         GetSphereTilePosition SphereTilePos;
         GetSphereTileRotation getSphereTileRotation;
@@ -76,6 +94,13 @@ namespace CompoundSpheres
                     buffer.Value.Dispose();
                 }
             }
+            if (SphereRows != null)
+            {
+                foreach (var row in SphereRows)
+                {
+                    row?.ReleaseRangeBuffer();
+                }
+            }
             Scales.Release();
             Colors.Release();
             Matrixes.Release();
@@ -91,10 +116,11 @@ namespace CompoundSpheres
         {
             Destroy(gameObject);
         }
-        internal SphereManager Init(int rows, int cols, SphereManagerSettings sphereManagerSettings)
-        {
-            Cols = cols;
-            Rows = rows;
+            internal SphereManager Init(int rows, int cols, SphereManagerSettings sphereManagerSettings)
+            {
+                var sw = Stopwatch.StartNew();
+                Cols = cols;
+                Rows = rows;
 
             SphereTileMesh = sphereManagerSettings.SphereTileMesh;
             Material = sphereManagerSettings.SphereTileMaterial;
@@ -127,15 +153,16 @@ namespace CompoundSpheres
             Material.SetBuffer("Scales", Scales);
             Material.SetBuffer("Textures", Textures);
 
-            if(sphereManagerSettings.CustomBuffers != null)
-            {
-                foreach(IBufferData buffer in sphereManagerSettings.CustomBuffers)
+                if(sphereManagerSettings.CustomBuffers != null)
                 {
-                    AddCustomBuffer(buffer);
+                    foreach(IBufferData buffer in sphereManagerSettings.CustomBuffers)
+                    {
+                        AddCustomBuffer(buffer);
+                    }
                 }
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.SphereManager.Init.Setup={sw.Elapsed.TotalMilliseconds:F3}ms");
+                return this;
             }
-            return this;
-        }
         private SphereManager() { }
         /// <summary>
         /// clamps a position + change to the X Axis
@@ -158,10 +185,38 @@ namespace CompoundSpheres
         {
             GetCameraRange(this, out int Min, out int Max);
             Material.SetFloat("ShouldRenderTextures", (int)getdisplaymode(this));
-            for (int i = Min; i < Max; i++)
+
+            if (FrustumCullingEnabled)
             {
-                int I = (int)Clamp(CameraX, i);
-                SphereRows[I].DrawTiles();
+                Camera cam = Camera.main;
+                Culler.UpdatePlanes(cam);
+                int totalCulled = 0;
+
+                for (int i = Min; i < Max; i++)
+                {
+                    int I = (int)Clamp(CameraX, i);
+                    SphereRow row = SphereRows[I];
+
+                    if (Culler.GetVisibleColumnRange(SphereTiles, I, Cols,
+                            _tileHalfSize, out int colStart, out int colCount))
+                    {
+                        row.DrawTiles(colStart, colCount);
+                        totalCulled += Cols - colCount;
+                    }
+                    else
+                    {
+                        totalCulled += Cols;
+                    }
+                }
+                _lastCulledTiles = totalCulled;
+            }
+            else
+            {
+                for (int i = Min; i < Max; i++)
+                {
+                    int I = (int)Clamp(CameraX, i);
+                    SphereRows[I].DrawTiles();
+                }
             }
         }
         /// <summary>
@@ -235,6 +290,26 @@ namespace CompoundSpheres
             Scales.SetBuffer(TotalTiles, (int i) => SphereTiles[i].UpdateScale());
             Colors.SetBuffer(TotalTiles, (int i) => SphereTiles[i].UpdateColor());
             Textures.SetBuffer<float>(TotalTiles, (int i) => SphereTiles[i].UpdateTexture());
+        }
+        /// <summary>
+        /// Whether the sphere manager has finished its buffer initialisation.
+        /// False while <see cref="BeginCoroutine"/> is still running.
+        /// </summary>
+        public bool IsReady { get; private set; }
+        /// <summary>
+        /// Coroutine version of <see cref="Begin"/> that spreads the heavy
+        /// buffer fills across multiple frames so the main thread stays
+        /// responsive during world load.
+        /// </summary>
+        internal IEnumerator BeginCoroutine(int chunkSize = 4096)
+        {
+            IsReady = false;
+            int done = 0;
+            yield return Matrixes.SetBufferChunked(TotalTiles, (int i) => SphereTiles[i].Matrix, chunkSize, () => done++);
+            yield return Scales.SetBufferChunked(TotalTiles, (int i) => SphereTiles[i].UpdateScale(), chunkSize, () => done++);
+            yield return Colors.SetBufferChunked(TotalTiles, (int i) => SphereTiles[i].UpdateColor(), chunkSize, () => done++);
+            yield return Textures.SetBufferChunked<float>(TotalTiles, (int i) => SphereTiles[i].UpdateTexture(), chunkSize, () => done++);
+            IsReady = true;
         }
         /// <summary>
         /// refresh the matrix array
@@ -358,8 +433,57 @@ namespace CompoundSpheres
                 {
                     throw new ArgumentException("Cols And Rows must be above 0 when creating a sphere manager");
                 }
+                var sw = Stopwatch.StartNew();
                 GameObject SphereManager = new GameObject(Name);
                 SphereManager Manager = SphereManager.AddComponent<SphereManager>().Init(rows, cols, sphereManagerSettings);
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.CreateSphereManager.InitOnly={sw.Elapsed.TotalMilliseconds:F3}ms");
+                sw.Restart();
+                BuildTilesAndRows(Manager, rows, cols);
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.CreateSphereManager.TileBuild={sw.Elapsed.TotalMilliseconds:F3}ms");
+                sw.Restart();
+                FinalizeRows(Manager, rows);
+                Manager.Begin();
+                Manager.IsReady = true;
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.CreateSphereManager.ManagerBegin={sw.Elapsed.TotalMilliseconds:F3}ms");
+                sw.Restart();
+                sphereManagerSettings.Initiation(Manager);
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.CreateSphereManager.Initiation={sw.Elapsed.TotalMilliseconds:F3}ms");
+                return Manager;
+            }
+            /// <summary>
+            /// Coroutine factory that creates the sphere manager and spreads
+            /// the heavy buffer fills across multiple frames.  The returned
+            /// <see cref="SphereManager"/> is available immediately but
+            /// <see cref="SphereManager.IsReady"/> will be false until the
+            /// coroutine finishes.  Callers should gate
+            /// <see cref="SphereManager.DrawTiles"/> on IsReady.
+            /// </summary>
+            public static IEnumerator CreateSphereManagerAsync(int rows, int cols, SphereManagerSettings sphereManagerSettings, Action<SphereManager> onCreated, int chunkSize = 4096, string Name = "SphereManager")
+            {
+                if (cols <= 0 || rows <= 0)
+                {
+                    throw new ArgumentException("Cols And Rows must be above 0 when creating a sphere manager");
+                }
+                var sw = Stopwatch.StartNew();
+                GameObject go = new GameObject(Name);
+                SphereManager Manager = go.AddComponent<SphereManager>().Init(rows, cols, sphereManagerSettings);
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.CreateSphereManagerAsync.InitOnly={sw.Elapsed.TotalMilliseconds:F3}ms");
+                sw.Restart();
+                yield return BuildTilesAndRowsAsync(Manager, rows, cols, chunkSize);
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.CreateSphereManagerAsync.TileBuild={sw.Elapsed.TotalMilliseconds:F3}ms");
+                sw.Restart();
+                FinalizeRows(Manager, rows);
+                // Hand the manager back immediately so the caller can store
+                // the reference; buffer fill happens over subsequent frames.
+                onCreated?.Invoke(Manager);
+                yield return Manager.BeginCoroutine(chunkSize);
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.CreateSphereManagerAsync.ManagerBegin={sw.Elapsed.TotalMilliseconds:F3}ms");
+                sw.Restart();
+                sphereManagerSettings.Initiation(Manager);
+                Debug.Log($"[WSM3D][PERF] CompoundSpheres.CreateSphereManagerAsync.Initiation={sw.Elapsed.TotalMilliseconds:F3}ms");
+            }
+            private static void BuildTilesAndRows(SphereManager Manager, int rows, int cols)
+            {
                 for (int X = 0; X < rows; X++)
                 {
                     SphereRow row = Manager.SphereRows[X] = new SphereRow(Manager, X);
@@ -368,9 +492,31 @@ namespace CompoundSpheres
                         Manager.SphereTiles[(X * cols) + Y] = new SphereTile(X, Y, row);
                     }
                 }
-                Manager.Begin();
-                sphereManagerSettings.Initiation(Manager);
-                return Manager;
+            }
+            private static IEnumerator BuildTilesAndRowsAsync(SphereManager Manager, int rows, int cols, int chunkSize = 4096)
+            {
+                int count = 0;
+                for (int X = 0; X < rows; X++)
+                {
+                    SphereRow row = Manager.SphereRows[X] = new SphereRow(Manager, X);
+                    for (int Y = 0; Y < cols; Y++)
+                    {
+                        Manager.SphereTiles[(X * cols) + Y] = new SphereTile(X, Y, row);
+                        if (++count % chunkSize == 0)
+                        {
+                            yield return null;
+                        }
+                    }
+                }
+            }
+            private static void FinalizeRows(SphereManager Manager, int rows)
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    Manager.SphereRows[r].InitRangeBuffer();
+                }
+                Bounds meshBounds = Manager.SphereTileMesh.bounds;
+                Manager._tileHalfSize = meshBounds.extents * 2f;
             }
         }
     }
