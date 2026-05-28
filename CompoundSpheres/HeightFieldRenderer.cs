@@ -21,6 +21,18 @@ namespace CompoundSpheres
         int _lastMaxRow = int.MinValue;
         int _lastCameraX = int.MinValue;
 
+        // Frame-coalesced rebuild throttle. Brush tools dirty hundreds of tiles
+        // per frame; each rebuild is a 1M-vert mesh on a 316² map. Without
+        // throttling the game freezes for the entire brush stroke. We defer
+        // rebuild until either (a) no new dirty arrived for QuietMs (brush
+        // stopped) or (b) we've been deferring for MaxStallMs (don't starve
+        // user feedback during a sustained drag).
+        float _lastDirtyTime = -1f;
+        float _lastRebuildTime = -1f;
+        const float QuietMs = 0.20f;      // seconds — wait 200ms after last dirty
+        const float MaxStallMs = 0.50f;   // seconds — force rebuild after 500ms of continuous dirty
+        const float MinIntervalMs = 0.10f; // seconds — minimum 100ms between rebuilds
+
         // Callbacks to retrieve per-tile height and color without coupling
         // CompoundSpheres to WorldSphereMod types. Set by the consumer.
         Func<int, int, float> _sampleHeight;
@@ -30,6 +42,8 @@ namespace CompoundSpheres
 
         // Cached arrays to avoid GC churn on rebuild.
         Vector3[] _vertices;
+        Vector3[] _normals;
+        float[] _cornerHeights;
         Color32[] _colors;
         Vector2[] _uvs;
         int[] _triangles;
@@ -83,6 +97,7 @@ namespace CompoundSpheres
         public void MarkDirty()
         {
             _dirty = true;
+            _lastDirtyTime = Time.realtimeSinceStartup;
         }
 
         /// <summary>
@@ -108,13 +123,37 @@ namespace CompoundSpheres
             int rows = _manager.Rows;
             int fullMin = 0;
             int fullMax = rows;
-            if (_dirty || _lastMinRow == int.MinValue)
+
+            bool isFirstBuild = _lastMinRow == int.MinValue;
+            bool shouldRebuild = isFirstBuild;
+
+            if (_dirty && !isFirstBuild)
+            {
+                // Brush-stroke coalescing: defer rebuild until brush goes quiet
+                // (no new dirty for QuietMs) OR we've been stalling for MaxStallMs.
+                // Also enforce a minimum interval between full rebuilds so
+                // rapid-fire dirties can't cause back-to-back 1M-vert rebuilds.
+                float now = Time.realtimeSinceStartup;
+                float sinceLastDirty = now - _lastDirtyTime;
+                float sinceLastRebuild = now - _lastRebuildTime;
+                bool brushQuiet = sinceLastDirty >= QuietMs;
+                bool stalledTooLong = sinceLastRebuild >= MaxStallMs;
+                bool intervalElapsed = sinceLastRebuild >= MinIntervalMs;
+
+                if ((brushQuiet || stalledTooLong) && intervalElapsed)
+                {
+                    shouldRebuild = true;
+                }
+            }
+
+            if (shouldRebuild)
             {
                 Rebuild(0, fullMin, fullMax, wrapped);
                 _lastMinRow = fullMin;
                 _lastMaxRow = fullMax;
                 _lastCameraX = 0;
                 _dirty = false;
+                _lastRebuildTime = Time.realtimeSinceStartup;
             }
 
             if (_material == null)
@@ -218,6 +257,19 @@ namespace CompoundSpheres
                     if (count == 0) count = 1;
                     float avgH = hSum / count;
 
+                    // Micro-displacement: tile corners would otherwise sit at exactly
+                    // averaged heights, producing perfectly flat shaded quads with
+                    // visible biome-color blobs. A small Perlin offset breaks the
+                    // uniformity so adjacent quads tilt differently and pick up
+                    // distinct lighting, giving the surface "roughness" without
+                    // requiring a detail-texture shader. Frequency 0.1 covers ~10
+                    // tiles per noise cycle; amplitude 0.15 stays well under the
+                    // typical 1.0-unit height step between biomes.
+                    // Use cc/cr-driven noise (stable across rebuilds, not world-x
+                    // because cylindrical wrapping would seam at the dateline).
+                    float noise = Mathf.PerlinNoise(cc * 0.1f, cr * 0.1f);
+                    avgH += (noise - 0.5f) * 0.3f;
+
                     // World position of this corner: it's at tile-grid coords
                     // (tileX + 0.5 or -0.5, tileY + 0.5 or -0.5) but the
                     // simpler formulation: corner (cr, cc) in local space
@@ -244,6 +296,7 @@ namespace CompoundSpheres
                     float worldY = cc - 0.5f;
 
                     _vertices[vi] = _projectPosition(worldX, worldY, avgH);
+                    _cornerHeights[vi] = avgH;
                     _colors[vi] = new Color32(
                         (byte)(rSum / count),
                         (byte)(gSum / count),
@@ -276,12 +329,40 @@ namespace CompoundSpheres
                 }
             }
 
+            // Analytic normals from the height-field gradient. Corner spacing is
+            // 1 world unit in both grid axes; tangents are (2, dh/dx, 0) and
+            // (0, dh/dz, 2) using central differences, so the normal is their
+            // cross product. This gives smooth per-vertex lighting on slopes
+            // instead of the flat-shaded-per-triangle look RecalculateNormals
+            // produces on a low-poly height field.
+            for (int cr = 0; cr < cornerRows; cr++)
+            {
+                int crM = cr > 0 ? cr - 1 : cr;
+                int crP = cr < cornerRows - 1 ? cr + 1 : cr;
+                for (int cc = 0; cc < cornerCols; cc++)
+                {
+                    int ccM = cc > 0 ? cc - 1 : cc;
+                    int ccP = cc < cornerCols - 1 ? cc + 1 : cc;
+
+                    float hxPlus  = _cornerHeights[crP * cornerCols + cc];
+                    float hxMinus = _cornerHeights[crM * cornerCols + cc];
+                    float hzPlus  = _cornerHeights[cr  * cornerCols + ccP];
+                    float hzMinus = _cornerHeights[cr  * cornerCols + ccM];
+
+                    Vector3 tx = new Vector3(2f, hxPlus - hxMinus, 0f);
+                    Vector3 tz = new Vector3(0f, hzPlus - hzMinus, 2f);
+                    Vector3 n = Vector3.Cross(tx, tz).normalized;
+                    if (n.y < 0f) n = -n;
+                    _normals[cr * cornerCols + cc] = n;
+                }
+            }
+
             _mesh.Clear();
             _mesh.vertices = SubArray(_vertices, vertCount);
+            _mesh.normals = SubArray(_normals, vertCount);
             _mesh.colors32 = SubArray(_colors, vertCount);
             _mesh.uv = SubArray(_uvs, vertCount);
             _mesh.triangles = SubArray(_triangles, triCount);
-            _mesh.RecalculateNormals();
             _mesh.RecalculateBounds();
         }
 
@@ -290,6 +371,8 @@ namespace CompoundSpheres
             if (_vertices == null || _vertices.Length < vertCount)
             {
                 _vertices = new Vector3[vertCount];
+                _normals = new Vector3[vertCount];
+                _cornerHeights = new float[vertCount];
                 _colors = new Color32[vertCount];
                 _uvs = new Vector2[vertCount];
             }
