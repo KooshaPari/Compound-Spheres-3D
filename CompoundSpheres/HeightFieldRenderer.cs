@@ -101,13 +101,19 @@ namespace CompoundSpheres
                 return;
             }
 
-            bool rangeChanged = (minRow != _lastMinRow || maxRow != _lastMaxRow || cameraX != _lastCameraX);
-            if (_dirty || rangeChanged)
+            // PERF: rebuild only when world tiles change (_dirty), NOT on every
+            // camera pan. Camera range changes do not require a CPU mesh rebuild
+            // — the GPU clips off-screen geometry trivially. The mesh now spans
+            // the full world; we ignore minRow/maxRow except on first build.
+            int rows = _manager.Rows;
+            int fullMin = 0;
+            int fullMax = rows;
+            if (_dirty || _lastMinRow == int.MinValue)
             {
-                Rebuild(cameraX, minRow, maxRow, wrapped);
-                _lastMinRow = minRow;
-                _lastMaxRow = maxRow;
-                _lastCameraX = cameraX;
+                Rebuild(0, fullMin, fullMax, wrapped);
+                _lastMinRow = fullMin;
+                _lastMaxRow = fullMax;
+                _lastCameraX = 0;
                 _dirty = false;
             }
 

@@ -58,6 +58,22 @@ namespace CompoundSpheres
         private GraphicsBuffer Scales, Colors, Textures, Matrixes;
         internal HashSet<int> _scales, _colors, _textures;
         private Dictionary<string, IBuffer> CustomBuffers;
+        /// <summary>
+        /// True iff at least one of the core dirty queues (scales, colors,
+        /// textures) currently has an entry. Used by consumers to gate
+        /// downstream mesh rebuilds — e.g. the heightfield only needs to
+        /// rebuild when actual tile data changed, not on every redraw tick.
+        /// </summary>
+        public bool HasDirtyTiles
+        {
+            get
+            {
+                if (_scales != null && _scales.Count > 0) return true;
+                if (_colors != null && _colors.Count > 0) return true;
+                if (_textures != null && _textures.Count > 0) return true;
+                return false;
+            }
+        }
         #endregion
         #region HeightField
         HeightFieldRenderer _heightField;
