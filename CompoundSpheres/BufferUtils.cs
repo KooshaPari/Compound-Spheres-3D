@@ -16,9 +16,11 @@ namespace CompoundSpheres
         /// </summary>
         public void Update(int I);
         /// <summary>
-        /// refreshes the buffer
+        /// refreshes the buffer, processing up to maxPerFrame dirty entries.
+        /// Returns true when all dirty entries have been processed,
+        /// false if more remain for the next call.
         /// </summary>
-        public void Refresh();
+        public bool Refresh(int maxPerFrame = 8192);
     }
     /// <summary>
     /// a class for managing a buffer efficiently
@@ -38,9 +40,9 @@ namespace CompoundSpheres
         /// <summary>
         /// refreshes all of the data
         /// </summary>
-        public void Refresh()
+        public bool Refresh(int maxPerFrame = 8192)
         {
-            Buffer.UpdateBuffer(ToUpdate, (int i) => getCustomData(Manager.SphereTiles[i]));
+            return Buffer.UpdateBuffer(ToUpdate, (int i) => getCustomData(Manager.SphereTiles[i]), Manager.TotalTiles, maxPerFrame);
         }
         internal CustomBuffer(SphereManager Manager, GraphicsBuffer Buffer, GetCustomData<T> getdata)
         {
@@ -100,25 +102,72 @@ namespace CompoundSpheres
             onComplete?.Invoke();
         }
         /// <summary>
-        /// Updates a buffer
+        /// Updates a buffer. When more than half the tiles are dirty, skips
+        /// sort and does a single full-buffer SetData (faster than sorting
+        /// 331K entries). Otherwise processes at most <paramref name="maxPerFrame"/>
+        /// dirty entries per call, leaving the rest for the next frame.
         /// </summary>
-        public static void UpdateBuffer<T>(this GraphicsBuffer buffer, HashSet<int> ToUpdate, Func<int, T> Function) where T : struct
+        /// <returns>true if all dirty entries were processed; false if more remain.</returns>
+        public static bool UpdateBuffer<T>(this GraphicsBuffer buffer, HashSet<int> ToUpdate, Func<int, T> Function, int totalTiles = 0, int maxPerFrame = 8192) where T : struct
         {
-            if (ToUpdate == null || ToUpdate.Count == 0) return;
+            if (ToUpdate == null || ToUpdate.Count == 0) return true;
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int count = ToUpdate.Count;
+
+            // Full rebuild path: when more than half the buffer is dirty,
+            // a single SetData of the entire array is cheaper than sorting.
+            if (totalTiles > 0 && count > totalTiles / 2)
+            {
+                T[] fullArray = new T[totalTiles];
+                for (int i = 0; i < totalTiles; i++)
+                {
+                    fullArray[i] = Function(i);
+                }
+                buffer.SetData(fullArray);
+                ToUpdate.Clear();
+                long fullMs = sw.ElapsedMilliseconds;
+                if (fullMs > 8)
+                {
+                    Debug.LogWarning($"[WSM3D][PERF] UpdateBuffer<{typeof(T).Name}> FULL REBUILD: {fullMs}ms count={count}/{totalTiles}");
+                }
+                return true;
+            }
+
+            // Chunked incremental path: process at most maxPerFrame entries.
+            int toProcess = count;
+            bool complete = true;
+            if (maxPerFrame > 0 && count > maxPerFrame)
+            {
+                toProcess = maxPerFrame;
+                complete = false;
+            }
 
             var sorted = UnityEngine.Pool.ListPool<int>.Get();
             sorted.AddRange(ToUpdate);
             sorted.Sort();
+            long sortMs = sw.ElapsedMilliseconds;
 
-            T[] Array = new T[ToUpdate.Count];
-            for (int i = 0; i < ToUpdate.Count; i++)
+            // Trim to the chunk we'll actually process this frame.
+            if (toProcess < sorted.Count)
+            {
+                sorted.RemoveRange(toProcess, sorted.Count - toProcess);
+            }
+
+            sw.Restart();
+            T[] Array = new T[toProcess];
+            for (int i = 0; i < toProcess; i++)
             {
                 Array[i] = Function(sorted[i]);
             }
+            long fillMs = sw.ElapsedMilliseconds;
+
+            sw.Restart();
             int BufferSize = 1;
             int ArrayStart = 0;
             int startIndex = sorted[0];
             int lastIndex = startIndex;
+            int setDataCalls = 0;
             for (int i = 1; i < sorted.Count; i++)
             {
                 int index = sorted[i];
@@ -129,6 +178,7 @@ namespace CompoundSpheres
                 else
                 {
                     buffer.SetData(Array, ArrayStart, startIndex, BufferSize);
+                    setDataCalls++;
                     startIndex = index;
                     ArrayStart = i;
                     BufferSize = 1;
@@ -138,9 +188,33 @@ namespace CompoundSpheres
             if (BufferSize > 0)
             {
                 buffer.SetData(Array, ArrayStart, startIndex, BufferSize);
+                setDataCalls++;
             }
-            ToUpdate.Clear();
+            long uploadMs = sw.ElapsedMilliseconds;
+
+            // Remove only the entries we processed from the dirty set.
+            if (complete)
+            {
+                ToUpdate.Clear();
+            }
+            else
+            {
+                for (int i = 0; i < sorted.Count; i++)
+                {
+                    ToUpdate.Remove(sorted[i]);
+                }
+            }
             UnityEngine.Pool.ListPool<int>.Release(sorted);
+
+            long total = sortMs + fillMs + uploadMs;
+            if (total > 8)
+            {
+                Debug.LogWarning($"[WSM3D][PERF] UpdateBuffer<{typeof(T).Name}> " +
+                    (complete ? "DONE" : "PARTIAL") + $": {total}ms " +
+                    $"(sort={sortMs}ms fill={fillMs}ms upload={uploadMs}ms " +
+                    $"count={toProcess}/{count} setDataCalls={setDataCalls})");
+            }
+            return complete;
         }
     }
 }

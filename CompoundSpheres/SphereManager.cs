@@ -59,6 +59,34 @@ namespace CompoundSpheres
         internal HashSet<int> _scales, _colors, _textures;
         private Dictionary<string, IBuffer> CustomBuffers;
         #endregion
+        #region HeightField
+        HeightFieldRenderer _heightField;
+        bool _useHeightField;
+        /// <summary>
+        /// When true, DrawTiles uses a continuous height-field mesh instead
+        /// of per-tile instanced quads. Set via SavedSettings.UseHeightFieldTerrain.
+        /// </summary>
+        public bool UseHeightFieldTerrain
+        {
+            get => _useHeightField;
+            set => _useHeightField = value;
+        }
+        /// <summary>
+        /// Access the height-field renderer for configuration (callbacks etc.).
+        /// Lazily created on first access.
+        /// </summary>
+        public HeightFieldRenderer HeightField
+        {
+            get
+            {
+                if (_heightField == null)
+                {
+                    _heightField = new HeightFieldRenderer(this);
+                }
+                return _heightField;
+            }
+        }
+        #endregion
         #region FrustumCulling
         /// <summary>
         /// Frustum culler instance used to skip off-screen rows/columns.
@@ -87,6 +115,8 @@ namespace CompoundSpheres
         #endregion
         private void OnDestroy()
         {
+            _heightField?.Dispose();
+            _heightField = null;
             if (CustomBuffers != null)
             {
                 foreach (var buffer in CustomBuffers)
@@ -185,6 +215,19 @@ namespace CompoundSpheres
         {
             GetCameraRange(this, out int Min, out int Max);
             Material.SetFloat("ShouldRenderTextures", (int)getdisplaymode(this));
+            int rowCount = Max - Min;
+            var sw = Stopwatch.StartNew();
+
+            if (_useHeightField && _heightField != null)
+            {
+                _heightField.RebuildAndDraw(CameraX, Min, Max, false);
+                long hfMs = sw.ElapsedMilliseconds;
+                if (hfMs > 16)
+                {
+                    Debug.LogWarning($"[WSM3D][PERF] DrawTiles HEIGHTFIELD SLOW: {hfMs}ms rows={rowCount} cols={Cols}");
+                }
+                return;
+            }
 
             if (FrustumCullingEnabled)
             {
@@ -217,6 +260,13 @@ namespace CompoundSpheres
                     int I = (int)Clamp(CameraX, i);
                     SphereRows[I].DrawTiles();
                 }
+            }
+            long ms = sw.ElapsedMilliseconds;
+            if (ms > 16)
+            {
+                Debug.LogWarning($"[WSM3D][PERF] DrawTiles SLOW: {ms}ms rows={rowCount} " +
+                    $"cols={Cols} total={Rows}x{Cols} culled={_lastCulledTiles} " +
+                    $"frustum={FrustumCullingEnabled}");
             }
         }
         /// <summary>
@@ -312,25 +362,28 @@ namespace CompoundSpheres
             IsReady = true;
         }
         /// <summary>
-        /// refresh the matrix array
+        /// refresh the scale buffer, processing at most maxPerFrame dirty entries.
+        /// Returns true when all entries are processed.
         /// </summary>
-        public void RefreshScales()
+        public bool RefreshScales(int maxPerFrame = 8192)
         {
-            Scales.UpdateBuffer(_scales, (int i) => SphereTiles[i].UpdateScale());
+            return Scales.UpdateBuffer(_scales, (int i) => SphereTiles[i].UpdateScale(), TotalTiles, maxPerFrame);
         }
         /// <summary>
-        /// refresh the color array
+        /// refresh the color buffer, processing at most maxPerFrame dirty entries.
+        /// Returns true when all entries are processed.
         /// </summary>
-        public void RefreshColors()
+        public bool RefreshColors(int maxPerFrame = 8192)
         {
-            Colors.UpdateBuffer(_colors, (int i) => SphereTiles[i].UpdateColor());
+            return Colors.UpdateBuffer(_colors, (int i) => SphereTiles[i].UpdateColor(), TotalTiles, maxPerFrame);
         }
         /// <summary>
-        /// refresh the texture array
+        /// refresh the texture buffer, processing at most maxPerFrame dirty entries.
+        /// Returns true when all entries are processed.
         /// </summary>
-        public void RefreshTextures()
+        public bool RefreshTextures(int maxPerFrame = 8192)
         {
-            Textures.UpdateBuffer<float>(_textures, (int i) => SphereTiles[i].UpdateTexture());
+            return Textures.UpdateBuffer<float>(_textures, (int i) => SphereTiles[i].UpdateTexture(), TotalTiles, maxPerFrame);
         }
         /// <summary>
         /// marks a tile's color to be refreshed
@@ -375,11 +428,12 @@ namespace CompoundSpheres
             _textures.Add(I);
         }
         /// <summary>
-        /// refreshes a custom buffer
+        /// refreshes a custom buffer, processing at most maxPerFrame dirty entries.
+        /// Returns true when all entries are processed.
         /// </summary>
-        public void RefreshCustom(string Name)
+        public bool RefreshCustom(string Name, int maxPerFrame = 8192)
         {
-            CustomBuffers[Name].Refresh();
+            return CustomBuffers[Name].Refresh(maxPerFrame);
         }
         /// <summary>
         /// marks a tile's custom property to be updated
