@@ -16,6 +16,11 @@ namespace CompoundSpheres
         readonly SphereManager _manager;
         Mesh _mesh;
         Material _material;
+        // Water surface lives in the fork as a SECOND corner-averaged sub-mesh built the
+        // same way as terrain, but at the per-tile water level (below sand), not as a
+        // main-mod billboard overlay. Null until ConfigureWater is called.
+        Mesh _waterMesh;
+        Material _waterMaterial;
         bool _dirty = true;
         int _lastMinRow = int.MinValue;
         int _lastMaxRow = int.MinValue;
@@ -40,6 +45,11 @@ namespace CompoundSpheres
         Func<int, int, int> _sampleTexture;
         Func<float, float, float, Vector3> _projectPosition;
 
+        // Water callbacks (nullable; when unset no water surface is emitted).
+        Func<int, int, bool> _sampleIsWater;   // (tx,ty) => tile is open water
+        Func<int, int, float> _sampleWaterLevel; // (tx,ty) => absolute water-surface height
+        Func<int, int, float> _sampleSeabed;     // (tx,ty) => terrain floor under the water column
+
         // Cached arrays to avoid GC churn on rebuild.
         Vector3[] _vertices;
         Vector3[] _normals;
@@ -48,7 +58,17 @@ namespace CompoundSpheres
         Vector2[] _uvs;
         int[] _triangles;
 
+        // Separate scratch arrays for the water sub-mesh (different topology: only
+        // corners touching a water tile are emitted).
+        Vector3[] _wVertices;
+        Vector3[] _wNormals;
+        float[] _wCornerHeights;
+        float[] _wDepth;
+        Color32[] _wColors;
+        int[] _wTriangles;
+
         public Mesh Mesh => _mesh;
+        public Mesh WaterMesh => _waterMesh;
         public bool Dirty => _dirty;
 
         public HeightFieldRenderer(SphereManager manager)
@@ -89,6 +109,46 @@ namespace CompoundSpheres
             _sampleColor = sampleColor ?? throw new ArgumentNullException(nameof(sampleColor));
             _sampleTexture = sampleTexture ?? throw new ArgumentNullException(nameof(sampleTexture));
             _projectPosition = projectPosition ?? throw new ArgumentNullException(nameof(projectPosition));
+        }
+
+        /// <summary>
+        /// Configure the water surface callbacks. Optional — when not called (or
+        /// passed nulls) the height field emits land only. The water sub-mesh is
+        /// built corner-averaged exactly like terrain, but each corner sits at the
+        /// averaged <paramref name="sampleWaterLevel"/> (which the caller derives
+        /// from WorldBox sea level / shore data), so it sits AT/BELOW the shore
+        /// rather than floating above it. Per-corner depth = waterLevel - seabed
+        /// is baked into vertex color for shore/depth shading.
+        /// </summary>
+        /// <param name="sampleIsWater">(tileX, tileY) => true if the tile is open water.</param>
+        /// <param name="sampleWaterLevel">(tileX, tileY) => absolute water-surface height (world units).</param>
+        /// <param name="sampleSeabed">(tileX, tileY) => terrain floor height under the water column.</param>
+        public void ConfigureWater(
+            Func<int, int, bool> sampleIsWater,
+            Func<int, int, float> sampleWaterLevel,
+            Func<int, int, float> sampleSeabed)
+        {
+            _sampleIsWater = sampleIsWater;
+            _sampleWaterLevel = sampleWaterLevel;
+            _sampleSeabed = sampleSeabed;
+            if (_waterMesh == null)
+            {
+                _waterMesh = new Mesh
+                {
+                    name = "HeightFieldWater",
+                    indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
+                };
+            }
+            MarkDirty();
+        }
+
+        /// <summary>
+        /// Set the material used to draw the water sub-mesh. Should be a translucent
+        /// (alpha-blended) material so terrain reads through the water column.
+        /// </summary>
+        public void SetWaterMaterial(Material mat)
+        {
+            _waterMaterial = mat;
         }
 
         /// <summary>
@@ -164,6 +224,12 @@ namespace CompoundSpheres
             if (_mesh.vertexCount > 0 && _material != null)
             {
                 Graphics.DrawMesh(_mesh, Matrix4x4.identity, _material, 0);
+            }
+
+            // Draw the water sub-mesh on top (translucent, queued after opaque land).
+            if (_waterMesh != null && _waterMesh.vertexCount > 0 && _waterMaterial != null)
+            {
+                Graphics.DrawMesh(_waterMesh, Matrix4x4.identity, _waterMaterial, 0);
             }
         }
 
@@ -364,6 +430,178 @@ namespace CompoundSpheres
             _mesh.uv = SubArray(_uvs, vertCount);
             _mesh.triangles = SubArray(_triangles, triCount);
             _mesh.RecalculateBounds();
+
+            RebuildWater(rowIndices, rowCount, cornerRows, cornerCols, wrapped);
+        }
+
+        /// <summary>
+        /// Build the water sub-mesh from the same corner grid as the land mesh.
+        /// A corner emits a water vertex iff any of its up-to-4 adjacent tiles is
+        /// water; quads are emitted only when all 4 of their corners are water (so
+        /// the surface stops at the shore rather than overshooting onto land).
+        /// Corner height = averaged sampleWaterLevel over its adjacent water tiles,
+        /// so the surface conforms to basins and sits below the shore. Depth =
+        /// waterLevel - seabed is baked into vertex color (R/B = depth fraction,
+        /// G = shore flag) reusing the scheme the old overlay proved.
+        /// </summary>
+        void RebuildWater(int[] rowIndices, int rowCount, int cornerRows, int cornerCols, bool wrapped)
+        {
+            if (_waterMesh == null || _sampleIsWater == null || _sampleWaterLevel == null)
+            {
+                if (_waterMesh != null) _waterMesh.Clear();
+                return;
+            }
+
+            int vertCount = cornerRows * cornerCols;
+            int maxTri = rowCount * (cornerCols - 1) * 6;
+            EnsureWaterArrays(vertCount, maxTri);
+
+            // First pass: per corner, average water level + depth over adjacent
+            // WATER tiles only; flag shore corners (touch a non-water tile).
+            // -1 marks a corner with no adjacent water (not part of the surface).
+            float maxDepth = 0.0001f;
+            for (int cr = 0; cr < cornerRows; cr++)
+            {
+                for (int cc = 0; cc < cornerCols; cc++)
+                {
+                    int vi = cr * cornerCols + cc;
+                    float wlSum = 0f, depthSum = 0f;
+                    int waterCount = 0;
+                    bool touchesLand = false;
+
+                    for (int dr = -1; dr <= 0; dr++)
+                    {
+                        int localRow = cr + dr;
+                        if (localRow < 0 || localRow >= rowCount) continue;
+                        int tileX = rowIndices[localRow];
+                        for (int dc = -1; dc <= 0; dc++)
+                        {
+                            int localCol = cc + dc;
+                            if (localCol < 0 || localCol >= _manager.Cols) continue;
+                            int tileY = localCol;
+
+                            if (_sampleIsWater(tileX, tileY))
+                            {
+                                float wl = _sampleWaterLevel(tileX, tileY);
+                                float seabed = _sampleSeabed != null ? _sampleSeabed(tileX, tileY) : wl;
+                                float depth = wl - seabed;
+                                if (depth < 0f) depth = 0f;
+                                wlSum += wl;
+                                depthSum += depth;
+                                waterCount++;
+                                if (depth > maxDepth) maxDepth = depth;
+                            }
+                            else
+                            {
+                                touchesLand = true;
+                            }
+                        }
+                    }
+
+                    if (waterCount == 0)
+                    {
+                        _wCornerHeights[vi] = float.NaN; // no water here
+                        _wColors[vi] = new Color32(0, 0, 0, 0);
+                        _wVertices[vi] = Vector3.zero;
+                        continue;
+                    }
+
+                    float avgWl = wlSum / waterCount;
+                    _wDepth[vi] = depthSum / waterCount;
+
+                    float worldX;
+                    if (cr < rowCount) worldX = rowIndices[cr] - 0.5f;
+                    else if (cr > 0) worldX = rowIndices[cr - 1] + 0.5f;
+                    else worldX = rowIndices[0] - 0.5f;
+                    float worldY = cc - 0.5f;
+
+                    _wVertices[vi] = _projectPosition(worldX, worldY, avgWl);
+                    _wCornerHeights[vi] = avgWl;
+                    // Stash shore flag in G; R/B/A finalized once maxDepth is known.
+                    _wColors[vi] = new Color32(0, (byte)(touchesLand ? 255 : 0), 0, 255);
+                    _uvs[vi] = new Vector2((float)cc / Mathf.Max(1, _manager.Cols), (float)cr / Mathf.Max(1, rowCount));
+                }
+            }
+
+            // Bake normalized depth into R/B and translucency into A (shallow water
+            // is clearer, deep water more opaque), now that maxDepth is known.
+            for (int vi = 0; vi < vertCount; vi++)
+            {
+                if (float.IsNaN(_wCornerHeights[vi])) continue;
+                float frac = Mathf.Clamp01(_wDepth[vi] / maxDepth);
+                byte f = (byte)(frac * 255f);
+                _wColors[vi] = new Color32(f, _wColors[vi].g, f, (byte)(140f + frac * 80f));
+            }
+
+            // Triangles: emit a quad only when all 4 corners are water vertices.
+            int ti = 0;
+            for (int r = 0; r < rowCount; r++)
+            {
+                for (int c = 0; c < cornerCols - 1; c++)
+                {
+                    int bl = r * cornerCols + c;
+                    int br = bl + 1;
+                    int tl = bl + cornerCols;
+                    int tr = tl + 1;
+                    if (float.IsNaN(_wCornerHeights[bl]) || float.IsNaN(_wCornerHeights[br]) ||
+                        float.IsNaN(_wCornerHeights[tl]) || float.IsNaN(_wCornerHeights[tr]))
+                        continue;
+
+                    _wTriangles[ti++] = bl; _wTriangles[ti++] = tl; _wTriangles[ti++] = br;
+                    _wTriangles[ti++] = br; _wTriangles[ti++] = tl; _wTriangles[ti++] = tr;
+                }
+            }
+
+            // Analytic normals from the water-level gradient (same math as land).
+            for (int cr = 0; cr < cornerRows; cr++)
+            {
+                int crM = cr > 0 ? cr - 1 : cr;
+                int crP = cr < cornerRows - 1 ? cr + 1 : cr;
+                for (int cc = 0; cc < cornerCols; cc++)
+                {
+                    int idx = cr * cornerCols + cc;
+                    if (float.IsNaN(_wCornerHeights[idx])) { _wNormals[idx] = Vector3.up; continue; }
+                    int ccM = cc > 0 ? cc - 1 : cc;
+                    int ccP = cc < cornerCols - 1 ? cc + 1 : cc;
+                    float hxP = Safe(_wCornerHeights[crP * cornerCols + cc], _wCornerHeights[idx]);
+                    float hxM = Safe(_wCornerHeights[crM * cornerCols + cc], _wCornerHeights[idx]);
+                    float hzP = Safe(_wCornerHeights[cr * cornerCols + ccP], _wCornerHeights[idx]);
+                    float hzM = Safe(_wCornerHeights[cr * cornerCols + ccM], _wCornerHeights[idx]);
+                    Vector3 tx = new Vector3(2f, hxP - hxM, 0f);
+                    Vector3 tz = new Vector3(0f, hzP - hzM, 2f);
+                    Vector3 n = Vector3.Cross(tx, tz).normalized;
+                    if (n.y < 0f) n = -n;
+                    _wNormals[idx] = n;
+                }
+            }
+
+            _waterMesh.Clear();
+            if (ti == 0) return; // no water tiles in view
+            _waterMesh.vertices = SubArray(_wVertices, vertCount);
+            _waterMesh.normals = SubArray(_wNormals, vertCount);
+            _waterMesh.colors32 = SubArray(_wColors, vertCount);
+            _waterMesh.triangles = SubArray(_wTriangles, ti);
+            _waterMesh.RecalculateBounds();
+        }
+
+        // NaN-safe gradient sample: a corner with no water uses its own height so
+        // the gradient at the shore stays finite.
+        static float Safe(float v, float fallback) => float.IsNaN(v) ? fallback : v;
+
+        void EnsureWaterArrays(int vertCount, int triCount)
+        {
+            if (_wVertices == null || _wVertices.Length < vertCount)
+            {
+                _wVertices = new Vector3[vertCount];
+                _wNormals = new Vector3[vertCount];
+                _wCornerHeights = new float[vertCount];
+                _wDepth = new float[vertCount];
+                _wColors = new Color32[vertCount];
+            }
+            if (_wTriangles == null || _wTriangles.Length < triCount)
+            {
+                _wTriangles = new int[triCount];
+            }
         }
 
         void EnsureArrays(int vertCount, int triCount)
@@ -399,6 +637,11 @@ namespace CompoundSpheres
             {
                 UnityEngine.Object.Destroy(_mesh);
                 _mesh = null;
+            }
+            if (_waterMesh != null)
+            {
+                UnityEngine.Object.Destroy(_waterMesh);
+                _waterMesh = null;
             }
         }
     }
