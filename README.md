@@ -1,3 +1,25 @@
+# Compound Spheres (KooshaPari/Compound-Spheres-3D fork)
+
+> Fork of [MelvinShwuaner/Compound-Spheres](https://github.com/MelvinShwuaner/Compound-Spheres),
+> branch `wsm3d/main`, consumed as a submodule by WorldSphereMod3D.
+> Full divergence audit: `../../docs/upstream-divergence-audit.md`.
+
+## Divergence from upstream
+
+Forked at upstream `c6fa56c` (2026-05-18). We are **5 ahead / 3 behind** upstream as of 2026-05-30.
+
+| Feature | Upstream behavior | Our fork behavior | User-facing change | Technical change | Outcome (what the user sees/gets) |
+|---|---|---|---|---|---|
+| Visibility culling | Camera-range row clamping only (X-axis rows) | Adds `FrustumCuller` integrated into `SphereManager.DrawTiles` | Fewer wasted draws when most of the world is off-screen | New `FrustumCuller.cs`; per-row frustum test before draw (`abb54ff`) | Higher FPS when zoomed in; no visible artifacts |
+| Buffer updates | `CustomBuffer.Refresh()` rebuilds all dirty entries in one call | Chunked `UpdateBuffer` — `Refresh(maxPerFrame=8192)`, full-rebuild fast-path when >half dirty | Smoother frames during mass tile changes (no single-frame hitch on 331K tiles) | `BufferUtils.cs` frame-budgeted incremental path + perf logging (`6e1cf94`) | No multi-second stall when terrain changes en masse |
+| Terrain rendering | Flat per-tile spheres/cubes only | `HeightFieldRenderer`: corner-averaged terrain LOD mesh | Real 3D terrain relief instead of flat tile tops | New `HeightFieldRenderer.cs` (`6e1cf94`) | Terrain has elevation/slopes |
+| Terrain micro-detail | None | Perlin micro-displacement on corner heights | Subtler, less grid-like terrain surface | Per-corner Perlin offset (`7213176`) | Organic-looking ground |
+| Water | None in backend (mod-side tile color) | Corner-averaged water sub-mesh in `HeightFieldRenderer` | Water reads as a translucent fluid surface | Water sub-mesh build (`ae19e1c`) | Visible water plane following terrain corners |
+| Rebuild gating | Refresh on demand | Rebuild gated on actual tile dirtiness; camera-pan-only frames skip rebuild | Smoother camera panning | Dirty-gate in heightfield rebuild (`ebe12a8`) | No rebuild churn while just moving the camera |
+| **NOT taken from upstream** | `b1b7d0a` SetMesh/SetRenderAmount; `bbf302c` ManagerBase + Dynamic* runtime add/remove + BufferBase/Enlarge; `5b87277` GPU compute matrix/color path | We stay CPU-side, frame-budgeted, with our own FrustumCuller + HeightFieldRenderer | — | These conflict with our submodule integration; tracked for selective cherry-pick (compute path is a candidate) | Our terrain pipeline, not upstream's |
+
+---
+
 # Compound Spheres!
 
 Compound Spheres is a unity tool for rendering 2d grids on 3d objects, it allows you to render these 2d tiles as any mesh, with their own rotation, scale and position. it also has 2 default data buffers, textures and colors, which provide the texture and color of each tile. you can easily add your own custom buffers too! 
