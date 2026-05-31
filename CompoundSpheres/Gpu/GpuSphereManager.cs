@@ -125,7 +125,7 @@ namespace CompoundSpheres.Gpu
         private int _lastCount = -1;
     }
 
-    public class GpuSphereManager : ManagerBase<GpuSphereTile>, IEnumerable
+    public class GpuSphereManager : ManagerBase<GpuSphereTile>, IEnumerable, IGridDimensions
     {
         public override GpuSphereTile this[int x, int y] => Tiles[(x * Cols) + y];
         public GpuSphereRow this[int x] => SphereRows[x];
