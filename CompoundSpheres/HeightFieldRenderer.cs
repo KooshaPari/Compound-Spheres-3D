@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace CompoundSpheres
@@ -55,7 +56,44 @@ namespace CompoundSpheres
         float _lastRebuildTime = -1f;
         const float QuietMs = 0.20f;      // seconds — wait 200ms after last dirty
         const float MaxStallMs = 0.50f;   // seconds — force rebuild after 500ms of continuous dirty
-        const float MinIntervalMs = 0.10f; // seconds — minimum 100ms between rebuilds
+        const float MinIntervalMs = 0.10f; // seconds — minimum 100ms between rebuilds during an active brush stroke
+
+        // PERF (residual rebuild-storm fix): the world's displayed tile-height
+        // (render_z) flickers continuously on a LIVE sim — open water animates,
+        // shore foam toggles, fire/lava spreads, biome morph — so the scale dirty
+        // queue is almost never empty even when the terrain SHAPE is effectively
+        // stable. Each such dirty previously forced a full 256² mesh re-bake at the
+        // 100ms floor => the recurring "HEIGHTFIELD SLOW: 295-896ms" storm. The goal
+        // is "bake ONCE on world-load, then stay clean". We can't make WorldBox stop
+        // re-dirtying, so we DEBOUNCE steady-state churn hard: after the first few
+        // post-load rebuilds the surface is settled, so we raise the minimum interval
+        // between full rebuilds to SteadyStateIntervalMs. Genuine terraforming still
+        // lands (within the interval) but cosmetic render_z flicker can no longer
+        // storm. Brush strokes are unaffected (they coalesce via QuietMs/MaxStallMs
+        // and still honour the tight MinIntervalMs while the stroke is active).
+        const float SteadyStateIntervalMs = 2.0f; // seconds between rebuilds once settled
+        // How many rebuilds count as the initial settle window (world-gen dirties
+        // the whole map; it converges over a handful of frames before flicker takes
+        // over). After this many, the steady-state interval applies.
+        const int SettleRebuildBudget = 6;
+        // realtime of the last NEW dirty that arrived AFTER the previous rebuild —
+        // used to detect a fresh terraform vs. the same tiles re-flickering.
+        float _lastResolvedRebuildTime = -1f;
+        // Diagnostic: why the most recent rebuild ran (logged under ProfileRebuild).
+        string _lastRebuildReason = "init";
+
+        // PERF: when set by the consumer (gated behind SavedSettings.ProfilerDump so
+        // it never spams the WorldBox debug-console overlay), each full Rebuild logs
+        // a Stopwatch breakdown of the corner-bake / triangle / normal passes. Off by
+        // default — per-frame logging is the documented overlay-spam trap.
+        public static bool ProfileRebuild = false;
+
+        // PERF instrumentation: counts how many times Rebuild() has actually run
+        // this session. Logged (under ProfileRebuild) on every rebuild so the
+        // deployed Player.log shows at a glance whether the terrain is baking ONCE
+        // on world-load (goal) or storming every frame (the bug). If this number
+        // climbs continuously while the camera is still, the dirty-gate is broken.
+        static int _rebuildCount;
 
         // Callbacks to retrieve per-tile height and color without coupling
         // CompoundSpheres to WorldSphereMod types. Set by the consumer.
@@ -168,6 +206,10 @@ namespace CompoundSpheres
                 name = "HeightFieldTerrain",
                 indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
             };
+            // The land mesh is re-uploaded on every terrain change. MarkDynamic
+            // tells Unity to keep it in CPU-writable memory so repeated uploads
+            // skip the expensive static-mesh re-residency path on the GPU.
+            _mesh.MarkDynamic();
         }
 
         /// <summary>
@@ -458,6 +500,7 @@ namespace CompoundSpheres
 
             bool isFirstBuild = _lastMinRow == int.MinValue;
             bool shouldRebuild = isFirstBuild;
+            if (isFirstBuild) _lastRebuildReason = "first-build";
 
             if (_dirty && !isFirstBuild)
             {
@@ -470,11 +513,25 @@ namespace CompoundSpheres
                 float sinceLastRebuild = now - _lastRebuildTime;
                 bool brushQuiet = sinceLastDirty >= QuietMs;
                 bool stalledTooLong = sinceLastRebuild >= MaxStallMs;
-                bool intervalElapsed = sinceLastRebuild >= MinIntervalMs;
+
+                // Steady-state debounce: once the world has settled (past the
+                // initial post-load convergence window), a full rebuild may run at
+                // most every SteadyStateIntervalMs. This is what kills the residual
+                // 295-896ms storm: continuous render_z flicker on the live sim keeps
+                // _dirty set, but the rebuild is now rate-limited to once per ~2s
+                // instead of every 100ms. During the settle window (or an active
+                // brush stroke, signalled by recent QuietMs-bounded dirties) we keep
+                // the tight 100ms floor so terraforming stays responsive.
+                bool settled = _rebuildCount >= SettleRebuildBudget;
+                float minInterval = settled ? SteadyStateIntervalMs : MinIntervalMs;
+                bool intervalElapsed = sinceLastRebuild >= minInterval;
 
                 if ((brushQuiet || stalledTooLong) && intervalElapsed)
                 {
                     shouldRebuild = true;
+                    _lastRebuildReason = settled
+                        ? (brushQuiet ? "steady-quiet" : "steady-stall")
+                        : (brushQuiet ? "settle-quiet" : "settle-stall");
                 }
             }
 
@@ -559,9 +616,18 @@ namespace CompoundSpheres
 
             EnsureArrays(vertCount, triCount);
 
+            var sw = ProfileRebuild ? System.Diagnostics.Stopwatch.StartNew() : null;
+
             // Build vertices: for each corner, average the heights & colors of
-            // the up-to-4 tiles that share it.
-            for (int cr = 0; cr < cornerRows; cr++)
+            // the up-to-4 tiles that share it. PARALLELIZED over corner ROWS:
+            // each iteration writes ONLY vertex indices in its own row
+            // (vi = cr*cornerCols+cc), so rows never collide and the per-corner
+            // work (sampleHeight/Color/Texture callbacks + averaging) is the
+            // single biggest cost in the rebuild. On an 8-core box this drops the
+            // O(corners*4) main-thread bake by ~Ncores. The sample callbacks must
+            // be pure reads of already-committed tile data (true here: RefreshSphere
+            // drains all dirty queues BEFORE MarkDirty, so no tile mutation races).
+            Parallel.For(0, cornerRows, cr =>
             {
                 for (int cc = 0; cc < cornerCols; cc++)
                 {
@@ -680,7 +746,9 @@ namespace CompoundSpheres
                         (float)cc / cols,
                         (float)cr / rowCount);
                 }
-            }
+            });
+
+            long bakeMs = sw?.ElapsedMilliseconds ?? 0;
 
             // Build triangles: two tris per quad.
             int ti = 0;
@@ -709,7 +777,11 @@ namespace CompoundSpheres
             // cross product. This gives smooth per-vertex lighting on slopes
             // instead of the flat-shaded-per-triangle look RecalculateNormals
             // produces on a low-poly height field.
-            for (int cr = 0; cr < cornerRows; cr++)
+            long triMs = sw?.ElapsedMilliseconds ?? 0;
+
+            // Normals are also per-corner-row independent: each iteration reads
+            // _cornerHeights (now fully populated) and writes only _normals[cr*..].
+            Parallel.For(0, cornerRows, cr =>
             {
                 int crM = cr > 0 ? cr - 1 : cr;
                 int crP = cr < cornerRows - 1 ? cr + 1 : cr;
@@ -729,15 +801,57 @@ namespace CompoundSpheres
                     if (n.y < 0f) n = -n;
                     _normals[cr * cornerCols + cc] = n;
                 }
-            }
+            });
+
+            long normMs = sw?.ElapsedMilliseconds ?? 0;
+
+            // GPU upload. PERF: the previous path was
+            //     _mesh.vertices = SubArray(...);  // x5 channels
+            // Each `SubArray` allocated + Array.Copy'd a fresh ~vertCount array
+            // (5 allocations of ~100k elems => GC churn every rebuild), and each
+            // Mesh.<channel> SETTER does its own managed->native marshal + bounds
+            // recompute. We now:
+            //   (1) keep MarkDynamic() (set in ctor) so the buffer stays
+            //       CPU-writable across re-uploads;
+            //   (2) use the Set*(array, start, length) overloads (Unity 2022.3+)
+            //       which upload directly from the cached scratch arrays with NO
+            //       SubArray allocation/copy, in one marshalled call per channel;
+            //   (3) pass MeshUpdateFlags.DontRecalculateBounds and set bounds once
+            //       at the end, instead of an implicit recompute per setter.
+            // This collapses the per-rebuild allocation to zero and removes the
+            // redundant per-setter work. (Full single-buffer interleaved upload via
+            // SetVertexBufferData is the next step but needs a struct vertex layout;
+            // tracked alongside the GPU-compute offload #199.)
+            const UnityEngine.Rendering.MeshUpdateFlags NoRecalc =
+                UnityEngine.Rendering.MeshUpdateFlags.DontRecalculateBounds |
+                UnityEngine.Rendering.MeshUpdateFlags.DontValidateIndices;
 
             _mesh.Clear();
-            _mesh.vertices = SubArray(_vertices, vertCount);
-            _mesh.normals = SubArray(_normals, vertCount);
-            _mesh.colors32 = SubArray(_colors, vertCount);
-            _mesh.uv = SubArray(_uvs, vertCount);
-            _mesh.triangles = SubArray(_triangles, triCount);
+            // SetVertices must precede SetTriangles (index validation needs the
+            // vertex count); bounds recompute deferred to the explicit call below.
+            _mesh.SetVertices(_vertices, 0, vertCount, NoRecalc);
+            _mesh.SetNormals(_normals, 0, vertCount, NoRecalc);
+            _mesh.SetColors(_colors, 0, vertCount, NoRecalc);
+            _mesh.SetUVs(0, _uvs, 0, vertCount);
+            _mesh.SetTriangles(_triangles, 0, triCount, 0, calculateBounds: false);
             _mesh.RecalculateBounds();
+
+            // Always advance the rebuild counter (not just under ProfileRebuild) so
+            // the settle-window debounce and the reason log stay consistent whether
+            // or not profiling is on.
+            _rebuildCount++;
+
+            if (sw != null)
+            {
+                sw.Stop();
+                long totalMs = sw.ElapsedMilliseconds;
+                Debug.LogWarning($"[WSM3D][PERF] HeightField.Rebuild #{_rebuildCount} {totalMs}ms " +
+                    $"reason={_lastRebuildReason} " +
+                    $"(bake={bakeMs}ms tri={triMs - bakeMs}ms norm={normMs - triMs}ms " +
+                    $"upload={totalMs - normMs}ms verts={vertCount} tris={triCount / 3}) " +
+                    "[steady-* reason climbing while idle => sim render_z flicker; " +
+                    "settle-* only during world-load convergence]");
+            }
 
             RebuildWater(rowIndices, rowCount, cornerRows, cornerCols, wrapped);
 

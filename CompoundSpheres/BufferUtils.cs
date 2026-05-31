@@ -163,34 +163,67 @@ namespace CompoundSpheres
             long fillMs = sw.ElapsedMilliseconds;
 
             sw.Restart();
-            int BufferSize = 1;
-            int ArrayStart = 0;
-            int startIndex = sorted[0];
-            int lastIndex = startIndex;
+            // PERF (death-by-a-thousand-uploads fix): the dirty indices are usually
+            // SCATTERED (sim recolors random tiles), so the per-contiguous-run
+            // SetData loop below issued one GPU upload per run — measured at
+            // setDataCalls=1055 for ~9.6k items. Thousands of tiny SetData calls
+            // are far slower than one bulk upload of the spanned region. When the
+            // run count would be high relative to the spanned range, coalesce into
+            // a SINGLE SetData over [minIdx..maxIdx]. We fill the gap tiles (clean
+            // tiles inside the span) with their CURRENT value via Function(idx) so
+            // the bulk upload doesn't clobber them. This trades a few extra
+            // Function() reads for collapsing 1000+ GPU calls into one.
+            int minIdx = sorted[0];
+            int maxIdx = sorted[sorted.Count - 1];
+            int span = maxIdx - minIdx + 1;
             int setDataCalls = 0;
-            for (int i = 1; i < sorted.Count; i++)
+            long uploadMs;
+            // Coalesce when the dirty set is fragmented (many runs) but spatially
+            // dense (span not hugely larger than the dirty count). One bulk upload
+            // of `span` contiguous elements beats `runs` scattered uploads once the
+            // run count climbs past a small threshold.
+            bool coalesce = sorted.Count >= 64 && span <= sorted.Count * 4;
+            if (coalesce)
             {
-                int index = sorted[i];
-                if (index-lastIndex == 1)
+                T[] spanArray = new T[span];
+                for (int s = 0; s < span; s++)
                 {
-                    BufferSize++;
+                    spanArray[s] = Function(minIdx + s);
                 }
-                else
+                buffer.SetData(spanArray, 0, minIdx, span);
+                setDataCalls = 1;
+                uploadMs = sw.ElapsedMilliseconds;
+            }
+            else
+            {
+                int BufferSize = 1;
+                int ArrayStart = 0;
+                int startIndex = sorted[0];
+                int lastIndex = startIndex;
+                for (int i = 1; i < sorted.Count; i++)
+                {
+                    int index = sorted[i];
+                    if (index-lastIndex == 1)
+                    {
+                        BufferSize++;
+                    }
+                    else
+                    {
+                        buffer.SetData(Array, ArrayStart, startIndex, BufferSize);
+                        setDataCalls++;
+                        startIndex = index;
+                        ArrayStart = i;
+                        BufferSize = 1;
+                    }
+                    lastIndex = index;
+                }
+                if (BufferSize > 0)
                 {
                     buffer.SetData(Array, ArrayStart, startIndex, BufferSize);
                     setDataCalls++;
-                    startIndex = index;
-                    ArrayStart = i;
-                    BufferSize = 1;
                 }
-                lastIndex = index;
+                uploadMs = sw.ElapsedMilliseconds;
             }
-            if (BufferSize > 0)
-            {
-                buffer.SetData(Array, ArrayStart, startIndex, BufferSize);
-                setDataCalls++;
-            }
-            long uploadMs = sw.ElapsedMilliseconds;
 
             // Remove only the entries we processed from the dirty set.
             if (complete)
