@@ -41,5 +41,14 @@ namespace CompoundSpheres.Compat
 
         /// <summary>OLD: per-tile rotation (CylindricalRotation). Recomputed CPU-side in the shim.</summary>
         Quaternion GetRotation(int index);
+
+        /// <summary>OLD: mark one tile's color dirty (re-pulled from the legacy color delegate, packed on GPU).</summary>
+        void UpdateColor(int index);
+
+        /// <summary>P2: feed a per-tile terrain height into the GPU matrix kernel's InputHeights buffer.</summary>
+        void SetHeight(int index, float height);
+
+        /// <summary>P2: bulk-feed all per-tile heights (HeightFieldRenderer integration), then GPU re-dispatch.</summary>
+        void SetHeights(System.Func<int, float> sampler);
     }
 }

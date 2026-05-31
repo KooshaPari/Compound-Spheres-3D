@@ -71,6 +71,45 @@ namespace CompoundSpheres
         public Mesh WaterMesh => _waterMesh;
         public bool Dirty => _dirty;
 
+        // -------------------------------------------------------------------
+        // P2 GPU-compute path. When a GPU shim is bound, every height-field
+        // rebuild also pushes per-tile heights into the new GPU manager's
+        // InputHeights compute buffer (HasHeights=1), so the OutputMatrices
+        // kernel places terrain tiles at their elevation on the GPU instead of
+        // relying on the CPU matrix path. This is additive: the legacy
+        // SphereManager mesh path is unchanged; binding is optional.
+        // -------------------------------------------------------------------
+        Compat.LegacyManagerShim _gpuShim;
+        /// <summary>
+        /// Bind a GPU-compute shim so terrain heights drive the GPU matrix
+        /// kernel's InputHeights buffer. The shim's GpuSphereManager must have
+        /// the same Rows/Cols grid as this renderer's SphereManager.
+        /// </summary>
+        public void BindGpu(Compat.LegacyManagerShim shim)
+        {
+            _gpuShim = shim;
+            PushHeightsToGpu();
+        }
+
+        /// <summary>
+        /// Fill the GPU InputHeights buffer from the per-tile sampleHeight
+        /// callback (indexed X*Cols+Y to match the GPU tile order) and trigger a
+        /// GPU matrix re-dispatch. No-op when no GPU shim is bound or not yet
+        /// configured.
+        /// </summary>
+        void PushHeightsToGpu()
+        {
+            if (_gpuShim == null || _sampleHeight == null) return;
+            int rows = _manager.Rows;
+            int cols = _manager.Cols;
+            _gpuShim.SetHeights(i =>
+            {
+                int x = i / cols;
+                int y = i % cols;
+                return _sampleHeight(x, y);
+            });
+        }
+
         public HeightFieldRenderer(SphereManager manager)
         {
             _manager = manager ?? throw new ArgumentNullException(nameof(manager));
@@ -209,6 +248,9 @@ namespace CompoundSpheres
             if (shouldRebuild)
             {
                 Rebuild(0, fullMin, fullMax, wrapped);
+                // P2: keep the GPU matrix kernel's InputHeights in sync with the
+                // CPU corner-averaged mesh after every terrain rebuild.
+                PushHeightsToGpu();
                 _lastMinRow = fullMin;
                 _lastMaxRow = fullMax;
                 _lastCameraX = 0;

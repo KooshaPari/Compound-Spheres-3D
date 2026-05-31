@@ -1,0 +1,217 @@
+using System;
+using System.Collections;
+using UnityEngine;
+
+namespace CompoundSpheres.Gpu
+{
+    // -----------------------------------------------------------------------
+    // P2: upstream SphereManager / SphereTile / SphereRow imported ADDITIVELY
+    // under CompoundSpheres.Gpu as GpuSphereManager / GpuSphereTile /
+    // GpuSphereRow. GPU-compute matrices + colors via CompoundSphereCompute.
+    // Source: git show upstream/main:CompoundSpheres/{SphereManager,SphereTile,SphereRow}.cs
+    // -----------------------------------------------------------------------
+
+    public delegate int GetGpuTileTexture(GpuSphereTile tile);
+    public delegate void GetGpuCameraRange(GpuSphereManager manager, out Range Rows, out Range Cols);
+    public delegate void GpuInitiation(GpuSphereManager manager);
+
+    public class GpuSphereManagerSettings : ManagerSettings<GpuSphereTile>
+    {
+        public GetGpuTileTexture GetSphereTileTexture;
+        public Texture2DArray TextureArray;
+        public GetGpuCameraRange GetCameraRange;
+        public GpuInitiation Initiation;
+    }
+
+    public class GpuSphereTile : TileBase
+    {
+        public GpuSphereRow Row { get; private set; }
+        public GpuSphereManager Manager => Row.Manager;
+        public int TextureIndex { get; private set; }
+        internal GpuSphereTile(int X, int Y, GpuSphereRow row) : base((row.Cols * X) + Y)
+        {
+            Row = row;
+            this.X = X;
+            this.Y = Y;
+            Color = default;
+            Scale = Vector3.one;
+        }
+        public override Vector3 UpdateScale()
+        {
+            Scale = Manager.SphereTileScale(this);
+            return Scale;
+        }
+        public int UpdateTexture()
+        {
+            TextureIndex = Manager.GpuTileTexture(this);
+            return TextureIndex;
+        }
+    }
+
+    public class GpuSphereRow : IEnumerable
+    {
+        public readonly GpuSphereManager Manager;
+        public GpuSphereTile this[int i] => Manager[Row, i];
+        public int Cols => Manager.Cols;
+        public readonly int Row;
+        public MaterialPropertyBlock Properties => _rp.matProps;
+        internal GpuSphereRow(GpuSphereManager manager, int Row)
+        {
+            Manager = manager;
+            this.Row = Row;
+            _rp = new RenderParams(manager.Material)
+            {
+                worldBounds = new Bounds(Vector3.zero, Vector3.one * 10000),
+                matProps = new MaterialPropertyBlock()
+            };
+            Properties.SetInteger("Row", Row * Cols);
+        }
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            for (int i = 0; i < Cols; i++) yield return this[i];
+        }
+        public void DrawTiles()
+        {
+            Graphics.RenderMeshIndirect(_rp, Manager.SphereTileMesh, Manager.CommandBuf, 1);
+        }
+        private RenderParams _rp;
+    }
+
+    public class GpuSphereManager : ManagerBase<GpuSphereTile>, IEnumerable
+    {
+        public override GpuSphereTile this[int x, int y] => Tiles[(x * Cols) + y];
+        public GpuSphereRow this[int x] => SphereRows[x];
+
+        internal GpuSphereRow[] SphereRows;
+        public int Rows { private set; get; }
+        public int Cols { private set; get; }
+        public float Radius { private set; get; }
+        public float Diameter => 2 * Radius;
+        public override int RowCount => Rows;
+        protected override float RadiusForCompute => Radius;
+
+        internal GraphicsBuffer CommandBuf;
+        readonly GraphicsBuffer.IndirectDrawIndexedArgs[] commandData = new GraphicsBuffer.IndirectDrawIndexedArgs[1];
+
+        GetGpuCameraRange GetCameraRange;
+        protected Buffer<float> Textures;
+        protected GetGpuTileTexture getSphereTileTexture;
+
+        protected override void OnDestroy()
+        {
+            base.OnDestroy();
+            CommandBuf?.Release();
+            Textures?.Dispose();
+        }
+
+        internal GpuSphereManager Init(int rows, int cols, GpuSphereManagerSettings settings)
+        {
+            Cols = cols;
+            Rows = rows;
+            Tiles = new GpuSphereTile[rows * cols];
+
+            base.Init(settings);
+            GetCameraRange = settings.GetCameraRange;
+
+            if (settings.TextureArray != null) Material.SetTexture("TextureArray", settings.TextureArray);
+            Textures = new Buffer<float>(GraphicsBuffer.Target.Structured, TotalTiles, Material, "Textures");
+            getSphereTileTexture = settings.GetSphereTileTexture;
+
+            Radius = Rows / (2 * Mathf.PI);
+            ComputeShader.SetFloat("Radius", Radius);
+            SphereRows = new GpuSphereRow[rows];
+
+            CommandBuf = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1, GraphicsBuffer.IndirectDrawIndexedArgs.size);
+            commandData[0].indexCountPerInstance = SphereTileMesh.GetIndexCount(0);
+            commandData[0].instanceCount = (uint)Cols;
+            CommandBuf.SetData(commandData);
+
+            return this;
+        }
+
+        internal override void Begin()
+        {
+            base.Begin();
+            if (getSphereTileTexture != null) Textures.Set((int i) => Tiles[i].UpdateTexture());
+        }
+
+        public void SetMesh(Mesh mesh)
+        {
+            SphereTileMesh = mesh;
+            commandData[0].indexCountPerInstance = SphereTileMesh.GetIndexCount(0);
+            CommandBuf.SetData(commandData);
+        }
+        void SetRenderAmount(uint amount)
+        {
+            commandData[0].instanceCount = amount;
+            CommandBuf.SetData(commandData);
+        }
+        private GpuSphereManager() { }
+
+        public void DrawTiles(int cameraX)
+        {
+            if (getdisplaymode != null) Material.SetFloat("ShouldRenderTextures", (int)getdisplaymode());
+            GetCameraRange(this, out Range Row, out Range Col);
+            for (int i = Row.Min; i < Row.Max; i++)
+            {
+                int I = (int)Clamp(cameraX, i);
+                SphereRows[I].DrawTiles();
+            }
+        }
+        public void DrawAllTiles()
+        {
+            if (getdisplaymode != null) Material.SetFloat("ShouldRenderTextures", (int)getdisplaymode());
+            SetRenderAmount((uint)Cols);
+            foreach (GpuSphereRow row in this) row.DrawTiles();
+        }
+
+        public Vector3 SphereTilePosition(float X, float Y, float Height = 0)
+            => GpuDefaults.CartesianToCylindrical(this, X, Y, Height);
+
+        public IEnumerator GetEnumerator() => SphereRows.GetEnumerator();
+
+        public void UpdateColor(int X, int Y) => SetColorDirty((X * Cols) + Y);
+        public void UpdateScale(int X, int Y) => UpdateScale((X * Cols) + Y);
+        public void UpdateTexture(int X, int Y) => UpdateTexture((X * Cols) + Y);
+
+        public int GpuTileTexture(GpuSphereTile tile) => getSphereTileTexture(tile);
+        public override void UpdateTexture(int I) => Textures[I] = Tiles[I].UpdateTexture();
+        public override void RefreshTextures() => Textures.Refresh();
+
+        public static class Creator
+        {
+            public static GpuSphereManager CreateSphereManager(int rows, int cols, GpuSphereManagerSettings settings, string Name = "GpuSphereManager")
+            {
+                if (cols <= 0 || rows <= 0)
+                    throw new ArgumentException("Cols And Rows must be above 0 when creating a sphere manager");
+                GameObject go = new GameObject(Name);
+                GpuSphereManager manager = go.AddComponent<GpuSphereManager>().Init(rows, cols, settings);
+                for (int X = 0; X < rows; X++)
+                {
+                    GpuSphereRow row = manager.SphereRows[X] = new GpuSphereRow(manager, X);
+                    for (int Y = 0; Y < cols; Y++)
+                        manager.Tiles[(X * cols) + Y] = new GpuSphereTile(X, Y, row);
+                }
+                manager.Begin();
+                settings.Initiation?.Invoke(manager);
+                return manager;
+            }
+        }
+    }
+
+    /// <summary>GPU-namespace default geometry helpers (mirror CompoundSpheres.DefaultSettings).</summary>
+    public static class GpuDefaults
+    {
+        public static Vector3 CartesianToCylindrical(GpuSphereManager manager, float X, float Y, float Height = 0)
+        {
+            float phi = X / manager.Rows * (2f * Mathf.PI);
+            float x = (manager.Radius + Height) * Mathf.Cos(phi);
+            float y = (manager.Radius + Height) * Mathf.Sin(phi);
+            return new Vector3(x, y, Y);
+        }
+        public static Quaternion CylindricalRotation(Vector2 position)
+            => Quaternion.LookRotation((Vector3)position) * Quaternion.Euler(0, -180, 0);
+        public static DisplayMode DefaultMode() => DisplayMode.ColoredTexture;
+        public static Vector3 DefaultScale(GpuSphereTile tile) => Vector3.one;
+    }
+}
