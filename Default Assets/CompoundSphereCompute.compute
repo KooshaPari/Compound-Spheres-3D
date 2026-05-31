@@ -6,12 +6,15 @@
 // dispatches in ManagerBase.Begin() / ComputeGraphicsBuffer.Refresh().
 //
 // ---------------------------------------------------------------------------
-// CONTRACT (must match CompoundSpheres/ManagerBase.cs + ComputeGraphicsBuffer):
+// CONTRACT (must match CompoundSpheres/Gpu/GpuManagerBase.cs + ComputeGraphicsBuffer):
 //
 //   Kernel "CSMatrices" (MatrixKernel) — writes resource OutputMatrices
 //     in : StructuredBuffer<float2>   InputPositions  // per-tile grid coord (X=row, Y=col)
 //     in : StructuredBuffer<int>      Dirty           // 1 = recompute this tile
 //     in : float                      Radius          // SphereManager.Radius = Rows / 2PI
+//     in : uint                       Shape           // 0=Cylindrical 1=Flat 2=Cube
+//     in : float                      ZDisplacement   // WSM Constants.ZDisplacement (=100)
+//     in : StructuredBuffer<CubeRegion> CubeRegions   // 6 cube faces (Shape==2 only)
 //     out: RWStructuredBuffer<float4x4> OutputMatrices // per-tile model (TRS) matrix
 //
 //   Kernel "CSColors" (ColorKernel) — writes resource OutputColors
@@ -19,77 +22,168 @@
 //     in : StructuredBuffer<int>      Dirty           // 1 = recompute this tile
 //     out: RWStructuredBuffer<uint>   OutputColors    // per-tile packed RGBA32
 //
-// Both kernels: numthreads(64,1,1); dispatched with TotalTiles/64 groups
-// (ManagerBase.Begin / ComputeGraphicsBuffer ThreadCount = ceil(Length/64)).
+// Both kernels: numthreads(64,1,1); dispatched with ceil(TotalTiles/64) groups.
 //
-// The matrix kernel REPLICATES the CPU formulas the old fork used per-tile so
-// the GPU path is drop-in identical visually:
-//   position  = DefaultSettings.CartesianToCylindrical(Radius, X, Y, height)
-//   rotation  = DefaultSettings.CylindricalRotation(position.xy)  (look-at + 180)
-//   scale     = applied in the vertex shader from the Scales buffer (NOT here)
-// Height defaults to 0 here; height-displaced tiles (HeightFieldRenderer, P2)
-// supply a per-tile height via the optional InputHeights buffer.
+// ---------------------------------------------------------------------------
+// 3-SHAPE PARITY (go-live core deliverable)
+//
+// The matrix kernel REPLICATES — exactly — the three CPU shape transforms WSM
+// uses (WorldSphereMod/Code/CompoundSphereScripts.cs + Tools.cs + Constants.cs):
+//
+//   Cylindrical (Shape==0): CompoundSphereScripts.CartesianToCylindrical
+//       xy = PointOnCircle(-X, Radius, height)         // phi = -X / Radius
+//          = (Radius+height) * (cos phi, sin phi)
+//       z  = Y + ZDisplacement
+//       rot = AngleAxis( atan2(pos.y,pos.x) deg, +Z ) * ConstRot
+//             ConstRot = Euler(0,90,180)
+//
+//   Flat (Shape==1): CompoundSphereScripts.CartesianToFlat
+//       pos = (X, height, Y + ZDisplacement)
+//       rot = ConstRot * ToUpright   (constant)
+//             ToUpright = Euler(90,0,0)
+//
+//   Cube (Shape==2): Tools.Cube.ToWorld(grid, height)  — region/face based.
+//       region = face whose Rect contains grid (X,Y)
+//       uv  = (grid - region.Rect.pos) / region.Rect.size
+//       pos = region.Start + Right*(uv.x*Size) + Up*(uv.y*Size) + Normal*height
+//       rot = ConstRot * ToUpright   (constant; matches CubeRotation(Vector2))
+//       NOTE: WSM's live CubeRotation(Vector2 _) returns the CONSTANT upright
+//       rotation (CompoundSphereScripts.cs:75). The per-region Direction in
+//       Tools.Cube.Region.Direction is only used by camera code, NOT by the
+//       tile renderer. We therefore mirror the live tile path (constant rot).
+//
+// height = InputHeights[i] when HasHeights==1, else 0.
+// scale  = applied in the vertex shader from the Scales buffer (NOT here).
+//
+// Quaternions are precomputed on the CPU (ConstRotFlatCube = ConstRot*ToUpright,
+// and ConstRot itself) and uploaded as float4 (x,y,z,w) uniforms so the HLSL
+// never has to reconstruct Unity's exact Euler ordering — guaranteeing parity.
 // ---------------------------------------------------------------------------
 
-// NOTE: kernel entry-point names MUST differ from the RW resource names
-// (HLSL forbids a kernel and a variable sharing an identifier — that collision
-// silently failed the bundle compile in the P1 authoring). The C# side passes
-// these kernel names ("CSMatrices"/"CSColors") as MatrixKernel/ColorKernel; the
-// buffer names (OutputMatrices/OutputColors) stay matched to the material.
 #pragma kernel CSMatrices
 #pragma kernel CSColors
 
 #define PI 3.14159265358979323846
 #define TWO_PI 6.28318530717958647692
+#define RAD2DEG 57.2957795130823208768
 
 // ---- Matrix kernel I/O ----
 StructuredBuffer<float2>    InputPositions;
 StructuredBuffer<int>       Dirty;
 RWStructuredBuffer<float4x4> OutputMatrices;
 
-// Optional per-tile height (P2 HeightFieldRenderer). When the buffer is not
-// bound Unity returns 0, which is the flat-cylinder default.
+// Optional per-tile height (HeightFieldRenderer). When the buffer is not
+// bound Unity returns 0, which is the flat default.
 StructuredBuffer<float>     InputHeights;
 
 float Radius;
 uint  TotalTiles;       // optional bounds guard (0 = unbounded)
 uint  HasHeights;       // 1 if InputHeights is bound, else 0
+uint  Shape;            // 0 = Cylindrical, 1 = Flat, 2 = Cube
+float ZDisplacement;    // WSM Constants.ZDisplacement (default 100)
+
+// Precomputed quaternions (x,y,z,w) — mirror WSM Constants exactly.
+//   ConstRot          = Quaternion.Euler(0,90,180)
+//   ConstRotUpright   = ConstRot * Quaternion.Euler(90,0,0)  (flat + cube)
+float4 ConstRot;
+float4 ConstRotUpright;
+
+// ---- Cube face regions (Shape==2). Mirrors Tools.Cube.Region. ----
+struct CubeRegion
+{
+    float2 RectPos;     // Rect.position (minx, miny) in grid coords
+    float2 RectSize;    // Rect.size (width, height) in grid coords
+    float3 Normal;
+    float3 Right;
+    float3 Up;
+    float3 Start;       // corner root in 3D space
+};
+StructuredBuffer<CubeRegion> CubeRegions;   // 6 entries
+float CubeSize;                             // Tools.Cube.Size
+uint  CubeRegionCount;                      // = 6 when cube data uploaded, else 0
 
 // ---- Color kernel I/O ----
 StructuredBuffer<uint>      InputColors;
 RWStructuredBuffer<uint>    OutputColors;
 
-// CartesianToCylindrical: grid (X=row, Y=col) -> world position on cylinder.
-// Mirrors DefaultSettings.CartesianToCylindrical exactly.
-//   phi = X / Rows * 2PI  ; Rows = Radius * 2PI  => phi = X / Radius
-float3 CartesianToCylindrical(float X, float Y, float height)
+// --------------------------------------------------------------------------
+// Quaternion helpers
+// --------------------------------------------------------------------------
+// Hamilton product q1 * q2 (Unity convention: rotate by q2 then q1 visually,
+// composed left-to-right same as Unity's operator*).
+float4 qmul(float4 a, float4 b)
 {
-    float phi = X / Radius;                 // X/Rows * 2PI, Rows = Radius*2PI
-    float r   = Radius + height;
-    float px  = r * cos(phi);
-    float py  = r * sin(phi);
-    float pz  = Y;
-    return float3(px, py, pz);
+    return float4(
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+    );
 }
 
-// Builds a rotation matrix equivalent to:
-//   Quaternion.LookRotation(forward=(pos.x,pos.y,0)) * Quaternion.Euler(0,-180,0)
-// i.e. tile faces radially outward from the cylinder axis. Unity LookRotation
-// uses +Z = forward, +Y = up(0,1,0). The Euler(0,-180,0) flips it to face out.
-float3x3 CylindricalRotation(float3 forward)
+// Quaternion (x,y,z,w) -> 3x3 rotation matrix (column vectors = basis axes),
+// matching Unity's Matrix4x4.Rotate(q).
+float3x3 quatToMat(float4 q)
 {
-    // forward in XY plane (z forced to 0 to match (Vector2)Position)
-    float3 fwd = normalize(float3(forward.x, forward.y, 0.0001));
-    float3 up  = float3(0, 1, 0);
-    float3 right = normalize(cross(up, fwd));
-    up = cross(fwd, right);
-    // LookRotation matrix columns = (right, up, fwd). Then * Euler(0,-180,0)
-    // (yaw 180) negates the right and forward axes.
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    float xx = x*x, yy = y*y, zz = z*z;
+    float xy = x*y, xz = x*z, yz = y*z;
+    float wx = w*x, wy = w*y, wz = w*z;
+    // Row-major basis identical to UnityEngine Matrix4x4.Rotate.
     return float3x3(
-        -right.x, up.x, -fwd.x,
-        -right.y, up.y, -fwd.y,
-        -right.z, up.z, -fwd.z
+        1 - 2*(yy+zz),     2*(xy - wz),     2*(xz + wy),
+            2*(xy + wz), 1 - 2*(xx+zz),     2*(yz - wx),
+            2*(xz - wy),     2*(yz + wx), 1 - 2*(xx+yy)
     );
+}
+
+// AngleAxis(angleDeg, axis) -> quaternion (axis assumed normalized).
+float4 angleAxis(float angleDeg, float3 axis)
+{
+    float half = angleDeg / RAD2DEG * 0.5;
+    float s = sin(half);
+    return float4(axis * s, cos(half));
+}
+
+// --------------------------------------------------------------------------
+// Shape transforms — each returns world position; rotation handled separately.
+// --------------------------------------------------------------------------
+
+// Cylindrical: PointOnCircle(-X, Radius, height); z = Y + ZDisplacement.
+float3 posCylindrical(float X, float Y, float height)
+{
+    float phi = -X / Radius;                 // PointOnCircle takes -X
+    float r   = Radius + height;
+    return float3(r * cos(phi), r * sin(phi), Y + ZDisplacement);
+}
+
+// Flat: (X, height, Y + ZDisplacement).
+float3 posFlat(float X, float Y, float height)
+{
+    return float3(X, height, Y + ZDisplacement);
+}
+
+// Cube: Tools.Cube.ToWorld(grid, height). Find the region whose Rect contains
+// the grid coord, then bilinear-place on that face + Normal*height.
+float3 posCube(float X, float Y, float height)
+{
+    float2 grid = float2(X, Y);
+    for (uint r = 0; r < CubeRegionCount; r++)
+    {
+        CubeRegion reg = CubeRegions[r];
+        float2 lo = reg.RectPos;
+        float2 hi = reg.RectPos + reg.RectSize;
+        // Rect.Contains: lo <= p < hi.
+        if (grid.x >= lo.x && grid.x < hi.x && grid.y >= lo.y && grid.y < hi.y)
+        {
+            float2 uv = (grid - reg.RectPos) / reg.RectSize;
+            return reg.Start
+                 + reg.Right * (uv.x * CubeSize)
+                 + reg.Up    * (uv.y * CubeSize)
+                 + reg.Normal * height;
+        }
+    }
+    return float3(0, 0, 0);   // matches ToWorld null-region fallback (Vector3.zero)
 }
 
 [numthreads(64,1,1)]
@@ -102,11 +196,30 @@ void CSMatrices(uint3 id : SV_DispatchThreadID)
     float2 grid = InputPositions[i];
     float height = (HasHeights == 1) ? InputHeights[i] : 0.0;
 
-    float3 pos = CartesianToCylindrical(grid.x, grid.y, height);
-    float3x3 rot = CylindricalRotation(pos);
+    float3 pos;
+    float4 q;
+    if (Shape == 1)
+    {
+        pos = posFlat(grid.x, grid.y, height);
+        q   = ConstRotUpright;
+    }
+    else if (Shape == 2)
+    {
+        pos = posCube(grid.x, grid.y, height);
+        q   = ConstRotUpright;
+    }
+    else // Shape == 0 (Cylindrical)
+    {
+        pos = posCylindrical(grid.x, grid.y, height);
+        // rot = AngleAxis(atan2(pos.y,pos.x) deg, +Z) * ConstRot
+        float ang = atan2(pos.y, pos.x) * RAD2DEG;
+        q = qmul(angleAxis(ang, float3(0, 0, 1)), ConstRot);
+    }
+
+    float3x3 rot = quatToMat(q);
 
     // Compose TRS (scale applied later in the vertex shader from Scales buffer).
-    // Column-major float4x4 with translation in the last column.
+    // Translation in the .w of each row so the shader's mul(M, v) places it.
     float4x4 m;
     m[0] = float4(rot[0][0], rot[0][1], rot[0][2], pos.x);
     m[1] = float4(rot[1][0], rot[1][1], rot[1][2], pos.y);
@@ -122,9 +235,8 @@ void CSColors(uint3 id : SV_DispatchThreadID)
     if (TotalTiles != 0 && i >= TotalTiles) return;
     if (Dirty[i] == 0) return;
 
-    // Pass-through pack: the CPU writes Color32 into InputColors; we copy it to
-    // the render-side OutputColors buffer (the vertex/frag shader unpacks RGBA32
-    // via Colors[ID] & 0xFF etc). Tinting / day-night / biome blends belong here
-    // in later phases so they run on the GPU instead of the CPU UpdateColor path.
+    // Pass-through pack: CPU writes Color32 into InputColors; copy to the
+    // render-side OutputColors buffer. Tinting / day-night / biome blends
+    // belong here in later phases to run on the GPU.
     OutputColors[i] = InputColors[i];
 }
