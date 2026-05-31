@@ -254,8 +254,21 @@ namespace CompoundSpheres.Gpu
             foreach (GpuSphereRow row in this) row.DrawTiles();
         }
 
+        // Cube geometry mirror (set by ConfigureCube) so the CPU frustum culler
+        // can compute cube-face world positions without a GPU readback.
+        internal GpuCubeRegion[] CubeRegions = System.Array.Empty<GpuCubeRegion>();
+        internal float CubeSize;
+
+        /// <summary>Select cube shape and cache the face regions for CPU culling.</summary>
+        public void UseCubeShape(GpuCubeRegion[] regions, float cubeSize)
+        {
+            CubeRegions = regions;
+            CubeSize = cubeSize;
+            ConfigureCube(regions, cubeSize);
+        }
+
         public Vector3 SphereTilePosition(float X, float Y, float Height = 0)
-            => GpuDefaults.CartesianToCylindrical(this, X, Y, Height);
+            => GpuDefaults.TileWorldPosition(this, X, Y, Height);
 
         public IEnumerator GetEnumerator() => SphereRows.GetEnumerator();
 
@@ -292,14 +305,20 @@ namespace CompoundSpheres.Gpu
     public static class GpuDefaults
     {
         public static Vector3 CartesianToCylindrical(GpuSphereManager manager, float X, float Y, float Height = 0)
+            => GpuShapeMath.PosCylindrical(manager.Radius, X, Y, Height);
+
+        /// <summary>World position for the manager's active shape (used by frustum culling).</summary>
+        public static Vector3 TileWorldPosition(GpuSphereManager manager, float X, float Y, float Height = 0)
         {
-            float phi = X / manager.Rows * (2f * Mathf.PI);
-            float x = (manager.Radius + Height) * Mathf.Cos(phi);
-            float y = (manager.Radius + Height) * Mathf.Sin(phi);
-            return new Vector3(x, y, Y);
+            switch (manager.Shape)
+            {
+                case TileShape.Flat: return GpuShapeMath.PosFlat(X, Y, Height);
+                case TileShape.Cube: return GpuShapeMath.PosCube(manager.CubeRegions, manager.CubeSize, X, Y, Height);
+                default: return GpuShapeMath.PosCylindrical(manager.Radius, X, Y, Height);
+            }
         }
         public static Quaternion CylindricalRotation(Vector2 position)
-            => Quaternion.LookRotation((Vector3)position) * Quaternion.Euler(0, -180, 0);
+            => GpuShapeMath.RotCylindrical(new Vector3(position.x, position.y, 0f));
         public static DisplayMode DefaultMode() => DisplayMode.ColoredTexture;
         public static Vector3 DefaultScale(GpuSphereTile tile) => Vector3.one;
     }

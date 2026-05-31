@@ -102,6 +102,7 @@ namespace CompoundSpheres.Gpu
             Colors?.Dispose();
             InputColors?.Dispose();
             InputHeights?.Dispose();
+            _cubeRegionBuffer?.Dispose();
         }
 
         protected void Init(ManagerSettings<T> Settings)
@@ -129,6 +130,13 @@ namespace CompoundSpheres.Gpu
             InputHeights = new GpuComputeBuffer<float>(ComputeShader, MatrixKernel, "InputHeights", TotalTiles);
             ComputeShader.SetInt("HasHeights", 0);
             ComputeShader.SetInt("TotalTiles", TotalTiles);
+            // Default to cylindrical with valid constant uniforms so the matrix
+            // kernel is well-formed even before a consumer calls ConfigureShape.
+            ComputeShader.SetInt("Shape", (int)TileShape.Cylindrical);
+            ComputeShader.SetFloat("ZDisplacement", GpuShapeMath.ZDisplacement);
+            ComputeShader.SetVector("ConstRot", QuatVec(GpuShapeMath.ConstRot));
+            ComputeShader.SetVector("ConstRotUpright", QuatVec(GpuShapeMath.ConstRotUpright));
+            ComputeShader.SetInt("CubeRegionCount", 0);
 
             Matrixes = new ComputeGraphicsBuffer<Matrix4x4>(ComputeShader, Material, MatrixKernel, "OutputMatrices", "Matrixes", TotalTiles, 64);
             Colors = new ComputeGraphicsBuffer<Color32>(ComputeShader, Material, ColorKernel, "OutputColors", "Colors", TotalTiles, 64);
@@ -224,6 +232,48 @@ namespace CompoundSpheres.Gpu
             _hasHeights = true;
             ComputeShader.SetInt("HasHeights", 1);
         }
+
+        // -------------------------------------------------------------------
+        // Shape configuration (go-live): uploads the Shape selector + the
+        // constant geometry uniforms the CSMatrices kernel needs to reproduce
+        // WSM's three tile shapes (cylindrical / flat / cube). Mirrors
+        // GpuShapeMath exactly. Call before the first Begin() dispatch.
+        // -------------------------------------------------------------------
+        TileShape _shape = TileShape.Cylindrical;
+        ComputeBuffer _cubeRegionBuffer;
+        /// <summary>Active tile shape (drives the compute Shape uniform).</summary>
+        public TileShape Shape => _shape;
+
+        /// <summary>
+        /// Select the cylindrical or flat tile shape and upload the constant
+        /// rotation + ZDisplacement uniforms. For <see cref="TileShape.Cube"/>
+        /// use <see cref="ConfigureCube"/> instead (it needs the face regions).
+        /// </summary>
+        public void ConfigureShape(TileShape shape)
+        {
+            _shape = shape;
+            ComputeShader.SetInt("Shape", (int)shape);
+            ComputeShader.SetFloat("ZDisplacement", GpuShapeMath.ZDisplacement);
+            SetQuat("ConstRot", GpuShapeMath.ConstRot);
+            SetQuat("ConstRotUpright", GpuShapeMath.ConstRotUpright);
+        }
+
+        /// <summary>
+        /// Select the cube tile shape and upload the 6 face regions + cube size.
+        /// </summary>
+        public void ConfigureCube(GpuCubeRegion[] regions, float cubeSize)
+        {
+            ConfigureShape(TileShape.Cube);
+            _cubeRegionBuffer?.Dispose();
+            _cubeRegionBuffer = new ComputeBuffer(regions.Length, GpuCubeRegion.Stride);
+            _cubeRegionBuffer.SetData(regions);
+            ComputeShader.SetBuffer(MatrixKernel, "CubeRegions", _cubeRegionBuffer);
+            ComputeShader.SetFloat("CubeSize", cubeSize);
+            ComputeShader.SetInt("CubeRegionCount", regions.Length);
+        }
+
+        void SetQuat(string name, Quaternion q) => ComputeShader.SetVector(name, QuatVec(q));
+        static Vector4 QuatVec(Quaternion q) => new Vector4(q.x, q.y, q.z, q.w);
 
         internal virtual void Begin()
         {
