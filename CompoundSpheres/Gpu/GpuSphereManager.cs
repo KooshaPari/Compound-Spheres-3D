@@ -48,7 +48,7 @@ namespace CompoundSpheres.Gpu
         }
     }
 
-    public class GpuSphereRow : IEnumerable
+    public class GpuSphereRow : IEnumerable, IDisposable
     {
         public readonly GpuSphereManager Manager;
         public GpuSphereTile this[int i] => Manager[Row, i];
@@ -65,16 +65,64 @@ namespace CompoundSpheres.Gpu
                 matProps = new MaterialPropertyBlock()
             };
             Properties.SetInteger("Row", Row * Cols);
+
+            // P3 (GPU adoption): per-row indirect command buffer so each row can
+            // draw only its visible column range (frustum cull). The shared
+            // manager.CommandBuf can only express one instanceCount for the whole
+            // frame; per-row buffers let DrawTiles(colStart,colCount) vary it.
+            _cmd = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1,
+                GraphicsBuffer.IndirectDrawIndexedArgs.size);
+            _cmdData[0].indexCountPerInstance = manager.SphereTileMesh.GetIndexCount(0);
+            _cmdData[0].instanceCount = (uint)Cols;
+            _cmd.SetData(_cmdData);
         }
         IEnumerator IEnumerable.GetEnumerator()
         {
             for (int i = 0; i < Cols; i++) yield return this[i];
         }
+
+        /// <summary>Draw the whole row (no cull).</summary>
         public void DrawTiles()
         {
-            Graphics.RenderMeshIndirect(_rp, Manager.SphereTileMesh, Manager.CommandBuf, 1);
+            Properties.SetInteger("Row", Row * Cols);
+            if (_lastCount != Cols)
+            {
+                _cmdData[0].instanceCount = (uint)Cols;
+                _cmd.SetData(_cmdData);
+                _lastCount = Cols;
+            }
+            Graphics.RenderMeshIndirect(_rp, Manager.SphereTileMesh, _cmd, 1);
         }
+
+        /// <summary>P3: draw only the visible contiguous column range [colStart, colStart+colCount).</summary>
+        public void DrawTiles(int colStart, int colCount)
+        {
+            if (colCount <= 0) return;
+            // Shift the instance base so SV_InstanceID 0 maps to colStart.
+            Properties.SetInteger("Row", (Row * Cols) + colStart);
+            if (_lastCount != colCount)
+            {
+                _cmdData[0].instanceCount = (uint)colCount;
+                _cmd.SetData(_cmdData);
+                _lastCount = colCount;
+            }
+            Graphics.RenderMeshIndirect(_rp, Manager.SphereTileMesh, _cmd, 1);
+        }
+
+        /// <summary>Re-sync the cached mesh index count after the manager swaps meshes.</summary>
+        internal void RefreshMeshIndexCount()
+        {
+            _cmdData[0].indexCountPerInstance = Manager.SphereTileMesh.GetIndexCount(0);
+            _cmd.SetData(_cmdData);
+        }
+
+        public void Dispose() => _cmd?.Release();
+
         private RenderParams _rp;
+        private readonly GraphicsBuffer _cmd;
+        private readonly GraphicsBuffer.IndirectDrawIndexedArgs[] _cmdData =
+            new GraphicsBuffer.IndirectDrawIndexedArgs[1];
+        private int _lastCount = -1;
     }
 
     public class GpuSphereManager : ManagerBase<GpuSphereTile>, IEnumerable
@@ -97,11 +145,22 @@ namespace CompoundSpheres.Gpu
         protected Buffer<float> Textures;
         protected GetGpuTileTexture getSphereTileTexture;
 
+        // P3 (GPU adoption): CPU frustum culler operating on grid (X,Y) +
+        // Radius-recomputed world positions (no GPU readback). Mirrors the
+        // legacy SphereManager.Culler path.
+        public readonly FrustumCuller Culler = new FrustumCuller();
+        public bool FrustumCullingEnabled = true;
+        Vector3 _tileHalfSize = Vector3.one;
+        int _lastCulledTiles;
+        public int LastCulledTiles => _lastCulledTiles;
+
         protected override void OnDestroy()
         {
             base.OnDestroy();
             CommandBuf?.Release();
             Textures?.Dispose();
+            if (SphereRows != null)
+                foreach (var row in SphereRows) row?.Dispose();
         }
 
         internal GpuSphereManager Init(int rows, int cols, GpuSphereManagerSettings settings)
@@ -126,6 +185,9 @@ namespace CompoundSpheres.Gpu
             commandData[0].instanceCount = (uint)Cols;
             CommandBuf.SetData(commandData);
 
+            if (SphereTileMesh != null)
+                _tileHalfSize = SphereTileMesh.bounds.extents * 2f;
+
             return this;
         }
 
@@ -140,6 +202,9 @@ namespace CompoundSpheres.Gpu
             SphereTileMesh = mesh;
             commandData[0].indexCountPerInstance = SphereTileMesh.GetIndexCount(0);
             CommandBuf.SetData(commandData);
+            if (SphereTileMesh != null) _tileHalfSize = SphereTileMesh.bounds.extents * 2f;
+            if (SphereRows != null)
+                foreach (var row in SphereRows) row?.RefreshMeshIndexCount();
         }
         void SetRenderAmount(uint amount)
         {
@@ -152,10 +217,34 @@ namespace CompoundSpheres.Gpu
         {
             if (getdisplaymode != null) Material.SetFloat("ShouldRenderTextures", (int)getdisplaymode());
             GetCameraRange(this, out Range Row, out Range Col);
-            for (int i = Row.Min; i < Row.Max; i++)
+
+            if (FrustumCullingEnabled)
             {
-                int I = (int)Clamp(cameraX, i);
-                SphereRows[I].DrawTiles();
+                Culler.UpdatePlanes(Camera.main);
+                int totalCulled = 0;
+                for (int i = Row.Min; i < Row.Max; i++)
+                {
+                    int I = (int)Clamp(cameraX, i);
+                    if (Culler.GetVisibleColumnRange(this, I, Cols, _tileHalfSize,
+                            out int colStart, out int colCount))
+                    {
+                        SphereRows[I].DrawTiles(colStart, colCount);
+                        totalCulled += Cols - colCount;
+                    }
+                    else
+                    {
+                        totalCulled += Cols;
+                    }
+                }
+                _lastCulledTiles = totalCulled;
+            }
+            else
+            {
+                for (int i = Row.Min; i < Row.Max; i++)
+                {
+                    int I = (int)Clamp(cameraX, i);
+                    SphereRows[I].DrawTiles();
+                }
             }
         }
         public void DrawAllTiles()

@@ -113,5 +113,56 @@ namespace CompoundSpheres
             colCount = lastColEnd - colStart;
             return true;
         }
+
+        // -------------------------------------------------------------------
+        // P3 (GPU adoption): the GPU manager keeps tiles as pure data — the
+        // legacy per-tile Vector3 SphereTile no longer exists; TileBase exposes
+        // only Vector2 grid Position. So we cull on (X=row, Y=col) and recompute
+        // the cylindrical WORLD position CPU-side from Radius via
+        // GpuDefaults.CartesianToCylindrical — no GPU readback. Identical chunked
+        // visible-column-range result as the legacy overload above.
+        // -------------------------------------------------------------------
+        public bool GetVisibleColumnRange(
+            CompoundSpheres.Gpu.GpuSphereManager manager, int rowIndex, int cols,
+            Vector3 tileHalfSize, out int colStart, out int colCount)
+        {
+            colStart = 0;
+            colCount = cols;
+
+            if (!_planesValid || manager == null)
+                return true;
+
+            int chunkCount = (cols + ChunkSize - 1) / ChunkSize;
+            int firstVisibleChunk = -1;
+            int lastVisibleChunk = -1;
+
+            for (int c = 0; c < chunkCount; c++)
+            {
+                int cStart = c * ChunkSize;
+                int cEnd = Math.Min(cStart + ChunkSize - 1, cols - 1);
+
+                // Recompute world pos from grid (X=rowIndex, Y=col) + Radius.
+                Vector3 first = CompoundSpheres.Gpu.GpuDefaults.CartesianToCylindrical(manager, rowIndex, cStart);
+                Vector3 last = CompoundSpheres.Gpu.GpuDefaults.CartesianToCylindrical(manager, rowIndex, cEnd);
+                Bounds chunkBounds = BoundsFromTileRange(first, last, tileHalfSize);
+
+                if (GeometryUtility.TestPlanesAABB(_frustumPlanes, chunkBounds))
+                {
+                    if (firstVisibleChunk < 0) firstVisibleChunk = c;
+                    lastVisibleChunk = c;
+                }
+            }
+
+            if (firstVisibleChunk < 0)
+            {
+                colCount = 0;
+                return false;
+            }
+
+            colStart = firstVisibleChunk * ChunkSize;
+            int lastColEnd = Math.Min((lastVisibleChunk + 1) * ChunkSize, cols);
+            colCount = lastColEnd - colStart;
+            return true;
+        }
     }
 }

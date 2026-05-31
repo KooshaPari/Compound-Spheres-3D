@@ -8,13 +8,13 @@
 // ---------------------------------------------------------------------------
 // CONTRACT (must match CompoundSpheres/ManagerBase.cs + ComputeGraphicsBuffer):
 //
-//   Kernel "OutputMatrices" (MatrixKernel)
+//   Kernel "CSMatrices" (MatrixKernel) — writes resource OutputMatrices
 //     in : StructuredBuffer<float2>   InputPositions  // per-tile grid coord (X=row, Y=col)
 //     in : StructuredBuffer<int>      Dirty           // 1 = recompute this tile
 //     in : float                      Radius          // SphereManager.Radius = Rows / 2PI
 //     out: RWStructuredBuffer<float4x4> OutputMatrices // per-tile model (TRS) matrix
 //
-//   Kernel "OutputColors" (ColorKernel)
+//   Kernel "CSColors" (ColorKernel) — writes resource OutputColors
 //     in : StructuredBuffer<uint>     InputColors     // per-tile packed RGBA32 (Color32)
 //     in : StructuredBuffer<int>      Dirty           // 1 = recompute this tile
 //     out: RWStructuredBuffer<uint>   OutputColors    // per-tile packed RGBA32
@@ -31,8 +31,13 @@
 // supply a per-tile height via the optional InputHeights buffer.
 // ---------------------------------------------------------------------------
 
-#pragma kernel OutputMatrices
-#pragma kernel OutputColors
+// NOTE: kernel entry-point names MUST differ from the RW resource names
+// (HLSL forbids a kernel and a variable sharing an identifier — that collision
+// silently failed the bundle compile in the P1 authoring). The C# side passes
+// these kernel names ("CSMatrices"/"CSColors") as MatrixKernel/ColorKernel; the
+// buffer names (OutputMatrices/OutputColors) stay matched to the material.
+#pragma kernel CSMatrices
+#pragma kernel CSColors
 
 #define PI 3.14159265358979323846
 #define TWO_PI 6.28318530717958647692
@@ -88,7 +93,7 @@ float3x3 CylindricalRotation(float3 forward)
 }
 
 [numthreads(64,1,1)]
-void OutputMatrices(uint3 id : SV_DispatchThreadID)
+void CSMatrices(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (TotalTiles != 0 && i >= TotalTiles) return;
@@ -111,7 +116,7 @@ void OutputMatrices(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(64,1,1)]
-void OutputColors(uint3 id : SV_DispatchThreadID)
+void CSColors(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (TotalTiles != 0 && i >= TotalTiles) return;

@@ -39,6 +39,13 @@ namespace CompoundSpheres.Gpu
         public abstract Vector3 UpdateScale();
     }
 
+    /// <summary>Canonical compute-kernel entry-point names baked into CompoundSphereCompute.compute.</summary>
+    public static class GpuKernels
+    {
+        public const string Matrix = "CSMatrices";
+        public const string Color = "CSColors";
+    }
+
     public class ManagerSettings<T> where T : TileBase
     {
         public Mesh SphereTileMesh;
@@ -105,8 +112,14 @@ namespace CompoundSpheres.Gpu
 
             getSphereTileScale = Settings.GetSphereTileScale;
             ComputeShader = Settings.ComputeShader;
-            MatrixKernel = Settings.ComputeShader.FindKernel(Settings.MatrixKernel);
-            ColorKernel = Settings.ComputeShader.FindKernel(Settings.ColorKernel);
+            // Default to the actual entry-point names baked into
+            // CompoundSphereCompute.compute. These intentionally DIFFER from the
+            // OutputMatrices/OutputColors resource names (HLSL forbids a kernel
+            // and a resource sharing an identifier).
+            string mk = string.IsNullOrEmpty(Settings.MatrixKernel) ? GpuKernels.Matrix : Settings.MatrixKernel;
+            string ck = string.IsNullOrEmpty(Settings.ColorKernel) ? GpuKernels.Color : Settings.ColorKernel;
+            MatrixKernel = ComputeShader.FindKernel(mk);
+            ColorKernel = ComputeShader.FindKernel(ck);
 
             Positions = new GpuComputeBuffer<Vector2>(ComputeShader, MatrixKernel, "InputPositions", TotalTiles);
             // InputColors feeds the color kernel; bound to ColorKernel.
