@@ -64,6 +64,13 @@ namespace CompoundSpheres
         // default — per-frame logging is the documented overlay-spam trap.
         public static bool ProfileRebuild = false;
 
+        // PERF instrumentation: counts how many times Rebuild() has actually run
+        // this session. Logged (under ProfileRebuild) on every rebuild so the
+        // deployed Player.log shows at a glance whether the terrain is baking ONCE
+        // on world-load (goal) or storming every frame (the bug). If this number
+        // climbs continuously while the camera is still, the dirty-gate is broken.
+        static int _rebuildCount;
+
         // Callbacks to retrieve per-tile height and color without coupling
         // CompoundSpheres to WorldSphereMod types. Set by the consumer.
         Func<int, int, float> _sampleHeight;
@@ -175,6 +182,10 @@ namespace CompoundSpheres
                 name = "HeightFieldTerrain",
                 indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
             };
+            // The land mesh is re-uploaded on every terrain change. MarkDynamic
+            // tells Unity to keep it in CPU-writable memory so repeated uploads
+            // skip the expensive static-mesh re-residency path on the GPU.
+            _mesh.MarkDynamic();
         }
 
         /// <summary>
@@ -755,21 +766,46 @@ namespace CompoundSpheres
 
             long normMs = sw?.ElapsedMilliseconds ?? 0;
 
+            // GPU upload. PERF: the previous path was
+            //     _mesh.vertices = SubArray(...);  // x5 channels
+            // Each `SubArray` allocated + Array.Copy'd a fresh ~vertCount array
+            // (5 allocations of ~100k elems => GC churn every rebuild), and each
+            // Mesh.<channel> SETTER does its own managed->native marshal + bounds
+            // recompute. We now:
+            //   (1) keep MarkDynamic() (set in ctor) so the buffer stays
+            //       CPU-writable across re-uploads;
+            //   (2) use the Set*(array, start, length) overloads (Unity 2022.3+)
+            //       which upload directly from the cached scratch arrays with NO
+            //       SubArray allocation/copy, in one marshalled call per channel;
+            //   (3) pass MeshUpdateFlags.DontRecalculateBounds and set bounds once
+            //       at the end, instead of an implicit recompute per setter.
+            // This collapses the per-rebuild allocation to zero and removes the
+            // redundant per-setter work. (Full single-buffer interleaved upload via
+            // SetVertexBufferData is the next step but needs a struct vertex layout;
+            // tracked alongside the GPU-compute offload #199.)
+            const UnityEngine.Rendering.MeshUpdateFlags NoRecalc =
+                UnityEngine.Rendering.MeshUpdateFlags.DontRecalculateBounds |
+                UnityEngine.Rendering.MeshUpdateFlags.DontValidateIndices;
+
             _mesh.Clear();
-            _mesh.vertices = SubArray(_vertices, vertCount);
-            _mesh.normals = SubArray(_normals, vertCount);
-            _mesh.colors32 = SubArray(_colors, vertCount);
-            _mesh.uv = SubArray(_uvs, vertCount);
-            _mesh.triangles = SubArray(_triangles, triCount);
+            // SetVertices must precede SetTriangles (index validation needs the
+            // vertex count); bounds recompute deferred to the explicit call below.
+            _mesh.SetVertices(_vertices, 0, vertCount, NoRecalc);
+            _mesh.SetNormals(_normals, 0, vertCount, NoRecalc);
+            _mesh.SetColors(_colors, 0, vertCount, NoRecalc);
+            _mesh.SetUVs(0, _uvs, 0, vertCount);
+            _mesh.SetTriangles(_triangles, 0, triCount, 0, calculateBounds: false);
             _mesh.RecalculateBounds();
 
             if (sw != null)
             {
                 sw.Stop();
-                long uploadMs = sw.ElapsedMilliseconds;
-                Debug.LogWarning($"[WSM3D][PERF] HeightField.Rebuild {uploadMs}ms " +
+                long totalMs = sw.ElapsedMilliseconds;
+                _rebuildCount++;
+                Debug.LogWarning($"[WSM3D][PERF] HeightField.Rebuild #{_rebuildCount} {totalMs}ms " +
                     $"(bake={bakeMs}ms tri={triMs - bakeMs}ms norm={normMs - triMs}ms " +
-                    $"upload={uploadMs - normMs}ms verts={vertCount} tris={triCount / 3})");
+                    $"upload={totalMs - normMs}ms verts={vertCount} tris={triCount / 3}) " +
+                    "[rebuildCount climbing while camera still => dirty-gate broken]");
             }
 
             RebuildWater(rowIndices, rowCount, cornerRows, cornerCols, wrapped);

@@ -74,6 +74,16 @@ namespace CompoundSpheres
                 return false;
             }
         }
+        /// <summary>
+        /// True iff the SCALE dirty queue has pending entries. Scale == per-tile
+        /// elevation in 3D, so this is the ONLY queue whose changes alter the
+        /// height-field mesh GEOMETRY. Color/texture churn (water-sim recolor,
+        /// fire flicker, mob tint) must NOT trigger a full geometry rebuild — that
+        /// is the per-frame 5s storm. The heightfield gates its expensive rebuild
+        /// on this instead of <see cref="HasDirtyTiles"/>. Color-only changes are
+        /// picked up by the renderer's own color re-bake without a geometry pass.
+        /// </summary>
+        public bool HasDirtyHeights => _scales != null && _scales.Count > 0;
         #endregion
         #region HeightField
         HeightFieldRenderer _heightField;
