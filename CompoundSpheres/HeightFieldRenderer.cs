@@ -56,7 +56,31 @@ namespace CompoundSpheres
         float _lastRebuildTime = -1f;
         const float QuietMs = 0.20f;      // seconds — wait 200ms after last dirty
         const float MaxStallMs = 0.50f;   // seconds — force rebuild after 500ms of continuous dirty
-        const float MinIntervalMs = 0.10f; // seconds — minimum 100ms between rebuilds
+        const float MinIntervalMs = 0.10f; // seconds — minimum 100ms between rebuilds during an active brush stroke
+
+        // PERF (residual rebuild-storm fix): the world's displayed tile-height
+        // (render_z) flickers continuously on a LIVE sim — open water animates,
+        // shore foam toggles, fire/lava spreads, biome morph — so the scale dirty
+        // queue is almost never empty even when the terrain SHAPE is effectively
+        // stable. Each such dirty previously forced a full 256² mesh re-bake at the
+        // 100ms floor => the recurring "HEIGHTFIELD SLOW: 295-896ms" storm. The goal
+        // is "bake ONCE on world-load, then stay clean". We can't make WorldBox stop
+        // re-dirtying, so we DEBOUNCE steady-state churn hard: after the first few
+        // post-load rebuilds the surface is settled, so we raise the minimum interval
+        // between full rebuilds to SteadyStateIntervalMs. Genuine terraforming still
+        // lands (within the interval) but cosmetic render_z flicker can no longer
+        // storm. Brush strokes are unaffected (they coalesce via QuietMs/MaxStallMs
+        // and still honour the tight MinIntervalMs while the stroke is active).
+        const float SteadyStateIntervalMs = 2.0f; // seconds between rebuilds once settled
+        // How many rebuilds count as the initial settle window (world-gen dirties
+        // the whole map; it converges over a handful of frames before flicker takes
+        // over). After this many, the steady-state interval applies.
+        const int SettleRebuildBudget = 6;
+        // realtime of the last NEW dirty that arrived AFTER the previous rebuild —
+        // used to detect a fresh terraform vs. the same tiles re-flickering.
+        float _lastResolvedRebuildTime = -1f;
+        // Diagnostic: why the most recent rebuild ran (logged under ProfileRebuild).
+        string _lastRebuildReason = "init";
 
         // PERF: when set by the consumer (gated behind SavedSettings.ProfilerDump so
         // it never spams the WorldBox debug-console overlay), each full Rebuild logs
@@ -476,6 +500,7 @@ namespace CompoundSpheres
 
             bool isFirstBuild = _lastMinRow == int.MinValue;
             bool shouldRebuild = isFirstBuild;
+            if (isFirstBuild) _lastRebuildReason = "first-build";
 
             if (_dirty && !isFirstBuild)
             {
@@ -488,11 +513,25 @@ namespace CompoundSpheres
                 float sinceLastRebuild = now - _lastRebuildTime;
                 bool brushQuiet = sinceLastDirty >= QuietMs;
                 bool stalledTooLong = sinceLastRebuild >= MaxStallMs;
-                bool intervalElapsed = sinceLastRebuild >= MinIntervalMs;
+
+                // Steady-state debounce: once the world has settled (past the
+                // initial post-load convergence window), a full rebuild may run at
+                // most every SteadyStateIntervalMs. This is what kills the residual
+                // 295-896ms storm: continuous render_z flicker on the live sim keeps
+                // _dirty set, but the rebuild is now rate-limited to once per ~2s
+                // instead of every 100ms. During the settle window (or an active
+                // brush stroke, signalled by recent QuietMs-bounded dirties) we keep
+                // the tight 100ms floor so terraforming stays responsive.
+                bool settled = _rebuildCount >= SettleRebuildBudget;
+                float minInterval = settled ? SteadyStateIntervalMs : MinIntervalMs;
+                bool intervalElapsed = sinceLastRebuild >= minInterval;
 
                 if ((brushQuiet || stalledTooLong) && intervalElapsed)
                 {
                     shouldRebuild = true;
+                    _lastRebuildReason = settled
+                        ? (brushQuiet ? "steady-quiet" : "steady-stall")
+                        : (brushQuiet ? "settle-quiet" : "settle-stall");
                 }
             }
 
@@ -797,15 +836,21 @@ namespace CompoundSpheres
             _mesh.SetTriangles(_triangles, 0, triCount, 0, calculateBounds: false);
             _mesh.RecalculateBounds();
 
+            // Always advance the rebuild counter (not just under ProfileRebuild) so
+            // the settle-window debounce and the reason log stay consistent whether
+            // or not profiling is on.
+            _rebuildCount++;
+
             if (sw != null)
             {
                 sw.Stop();
                 long totalMs = sw.ElapsedMilliseconds;
-                _rebuildCount++;
                 Debug.LogWarning($"[WSM3D][PERF] HeightField.Rebuild #{_rebuildCount} {totalMs}ms " +
+                    $"reason={_lastRebuildReason} " +
                     $"(bake={bakeMs}ms tri={triMs - bakeMs}ms norm={normMs - triMs}ms " +
                     $"upload={totalMs - normMs}ms verts={vertCount} tris={triCount / 3}) " +
-                    "[rebuildCount climbing while camera still => dirty-gate broken]");
+                    "[steady-* reason climbing while idle => sim render_z flicker; " +
+                    "settle-* only during world-load convergence]");
             }
 
             RebuildWater(rowIndices, rowCount, cornerRows, cornerCols, wrapped);
