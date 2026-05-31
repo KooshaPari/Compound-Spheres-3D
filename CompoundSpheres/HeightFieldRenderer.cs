@@ -200,6 +200,136 @@ namespace CompoundSpheres
             _projectPosition = projectPosition ?? throw new ArgumentNullException(nameof(projectPosition));
         }
 
+        #region TERRAIN-OVERLAY
+        // ====================================================================
+        // TERRAIN-OVERLAY family. Tints/layers the LAND height-field mesh per
+        // WorldBox tile overlay state — snow coverage, tumor/corruption creep,
+        // burnt char, and frozen ice. This is intentionally SEPARATE from the
+        // liquid/water sub-mesh path (RebuildWater / RebuildLiquidLayer): the
+        // overlay only touches the terrain vertex-color bake in Rebuild via the
+        // corner-averaged _sampleOverlay callback and ApplyTerrainOverlay below.
+        //
+        // The overlay is a CHEAP vertex-color blend over the averaged biome
+        // color. No extra mesh, no extra draw call — it rides the existing land
+        // mesh. TUMOR is dynamic (spreads over time); the consumer dirties the
+        // renderer when corruption changes so affected corners re-bake.
+        // ====================================================================
+
+        /// <summary>
+        /// Per-tile overlay state fed from WorldBox tile data. Plain POD so the
+        /// fork stays decoupled from WorldSphereMod / Assembly-CSharp types — the
+        /// main mod reads the real tile fields and fills this in.
+        /// Amounts are 0..1 coverage fractions; they are averaged over the
+        /// up-to-4 tiles that share a mesh corner.
+        /// </summary>
+        public struct TerrainOverlay
+        {
+            /// <summary>Snow coverage 0..1 (heavier on cold biomes / peaks).</summary>
+            public float Snow;
+            /// <summary>Tumor/corruption creep 0..1 (dynamic; emissive violet).</summary>
+            public float Corruption;
+            /// <summary>Burnt/char 0..1 (after fire).</summary>
+            public float Burnt;
+            /// <summary>Frozen/ice 0..1 (pale-blue).</summary>
+            public float Frozen;
+
+            internal void Accumulate(TerrainOverlay o)
+            {
+                Snow += o.Snow;
+                Corruption += o.Corruption;
+                Burnt += o.Burnt;
+                Frozen += o.Frozen;
+            }
+
+            internal void Normalize(int count)
+            {
+                if (count <= 0) return;
+                float inv = 1f / count;
+                Snow *= inv;
+                Corruption *= inv;
+                Burnt *= inv;
+                Frozen *= inv;
+            }
+        }
+
+        /// <summary>
+        /// Configure the terrain-overlay callback. Optional — when not called the
+        /// land mesh bakes base biome color only. <paramref name="sampleOverlay"/>
+        /// returns the overlay coverage for a tile; out-of-bounds coords should be
+        /// clamped/wrapped by the caller (same convention as the other callbacks).
+        /// </summary>
+        public void ConfigureTerrainOverlay(Func<int, int, TerrainOverlay> sampleOverlay)
+        {
+            _sampleOverlay = sampleOverlay;
+            MarkDirty();
+        }
+
+        /// <summary>
+        /// Blend the overlay tints over a base biome color. Ordering matters:
+        /// burnt darkens first (it sits under everything), then corruption creep
+        /// (emissive violet, the most visually dominant living overlay), then snow
+        /// (white coverage, boosted by elevation), then frozen ice (pale blue,
+        /// applied last so a frozen surface always reads cold even under snow).
+        /// Each layer is a simple lerp by its coverage fraction — cheap, no shader.
+        /// </summary>
+        static Color32 ApplyTerrainOverlay(Color32 baseColor, TerrainOverlay ov, float elevation)
+        {
+            // Work in float RGB 0..1.
+            float r = baseColor.r / 255f;
+            float g = baseColor.g / 255f;
+            float b = baseColor.b / 255f;
+
+            // BURNT — dark char. Crush toward near-black with a faint warm ember.
+            if (ov.Burnt > 0.001f)
+            {
+                float t = Mathf.Clamp01(ov.Burnt);
+                r = Mathf.Lerp(r, 0.10f, t);
+                g = Mathf.Lerp(g, 0.07f, t);
+                b = Mathf.Lerp(b, 0.06f, t);
+            }
+
+            // CORRUPTION / TUMOR — emissive purple/violet creep. Push strongly
+            // toward violet and brighten slightly so it reads as glowing biomass.
+            if (ov.Corruption > 0.001f)
+            {
+                float t = Mathf.Clamp01(ov.Corruption);
+                r = Mathf.Lerp(r, 0.55f, t);
+                g = Mathf.Lerp(g, 0.08f, t);
+                b = Mathf.Lerp(b, 0.70f, t);
+            }
+
+            // SNOW — white coverage. Stronger at high elevation: peaks accumulate
+            // more snow than valleys for the same tile coverage value. Elevation
+            // is the corner's averaged terrain height (post micro-displacement).
+            if (ov.Snow > 0.001f)
+            {
+                // Map elevation to a 0.6..1.0 multiplier so high ground gets full
+                // snow while lowland snow stays partial. Heights are unscaled
+                // (pre-HeightMult) tile heights, typically ~0..30; clamp gently.
+                float elevBoost = 0.6f + 0.4f * Mathf.Clamp01(elevation / 24f);
+                float t = Mathf.Clamp01(ov.Snow * elevBoost);
+                r = Mathf.Lerp(r, 0.95f, t);
+                g = Mathf.Lerp(g, 0.96f, t);
+                b = Mathf.Lerp(b, 1.00f, t);
+            }
+
+            // FROZEN — pale-blue ice. Applied last; tints whatever is below cold.
+            if (ov.Frozen > 0.001f)
+            {
+                float t = Mathf.Clamp01(ov.Frozen);
+                r = Mathf.Lerp(r, 0.72f, t);
+                g = Mathf.Lerp(g, 0.85f, t);
+                b = Mathf.Lerp(b, 0.98f, t);
+            }
+
+            return new Color32(
+                (byte)(Mathf.Clamp01(r) * 255f),
+                (byte)(Mathf.Clamp01(g) * 255f),
+                (byte)(Mathf.Clamp01(b) * 255f),
+                255);
+        }
+        #endregion
+
         /// <summary>
         /// Configure the water surface callbacks. Optional — when not called (or
         /// passed nulls) the height field emits land only. The water sub-mesh is
@@ -445,6 +575,12 @@ namespace CompoundSpheres
                     int dominantTex = 0;
                     float maxContrib = -1f;
 
+                    // TERRAIN-OVERLAY: accumulate per-tile overlay state over the
+                    // same up-to-4 adjacent tiles so the corner tint is averaged
+                    // exactly like base color/height. See the TERRAIN-OVERLAY region.
+                    TerrainOverlay ovAccum = default;
+                    int ovCount = 0;
+
                     for (int dr = -1; dr <= 0; dr++)
                     {
                         int localRow = cr + dr;
@@ -464,6 +600,12 @@ namespace CompoundSpheres
                             gSum += c.g;
                             bSum += c.b;
                             count++;
+
+                            if (_sampleOverlay != null)
+                            {
+                                ovAccum.Accumulate(_sampleOverlay(tileX, tileY));
+                                ovCount++;
+                            }
 
                             // Dominant texture: pick the tile with highest height
                             // contribution (simple heuristic).
@@ -518,11 +660,22 @@ namespace CompoundSpheres
 
                     _vertices[vi] = _projectPosition(worldX, worldY, avgH);
                     _cornerHeights[vi] = avgH;
-                    _colors[vi] = new Color32(
+
+                    Color32 baseColor = new Color32(
                         (byte)(rSum / count),
                         (byte)(gSum / count),
                         (byte)(bSum / count),
                         255);
+                    // TERRAIN-OVERLAY: blend snow/tumor/burnt/frozen tint over the
+                    // averaged biome color (cheap vertex-color layering). Driven by
+                    // the corner-averaged overlay state; elevation passed so snow
+                    // reads heavier on peaks.
+                    if (ovCount > 0)
+                    {
+                        ovAccum.Normalize(ovCount);
+                        baseColor = ApplyTerrainOverlay(baseColor, ovAccum, avgH);
+                    }
+                    _colors[vi] = baseColor;
                     _uvs[vi] = new Vector2(
                         (float)cc / cols,
                         (float)cr / rowCount);
