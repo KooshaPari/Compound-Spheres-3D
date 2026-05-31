@@ -11,14 +11,33 @@ namespace CompoundSpheres
     /// the per-tile instanced-quad draw with a single unified mesh per visible
     /// region. ADR-0017 M0 — flat shape (CurrentShape=0) only.
     /// </summary>
+    /// <summary>
+    /// Liquid surface type. Each kind gets its own corner-averaged sub-mesh at its
+    /// own level with a per-type material. Water is the original, pixel-verified
+    /// surface; the others reuse the identical corner-average + analytic-normal +
+    /// depth-shading math, differing only in classification + material.
+    /// </summary>
+    public enum LiquidKind
+    {
+        Water = 0,
+        Lava = 1,
+        Swamp = 2,
+        Acid = 3,
+    }
+
     public class HeightFieldRenderer
     {
         readonly SphereManager _manager;
         Mesh _mesh;
         Material _material;
-        // Water surface lives in the fork as a SECOND corner-averaged sub-mesh built the
-        // same way as terrain, but at the per-tile water level (below sand), not as a
-        // main-mod billboard overlay. Null until ConfigureWater is called.
+        // Liquid surfaces live in the fork as ADDITIONAL corner-averaged sub-meshes built
+        // the same way as terrain, but at each liquid's per-tile level (below sand), not as
+        // a main-mod billboard/2D-overlay. Each LiquidKind has its own layer. Empty until
+        // ConfigureLiquid (or the ConfigureWater shim) is called.
+        //
+        // The original single-water fields below are retained as the Water layer's storage
+        // so the verified water path is byte-for-byte unchanged; additional kinds get their
+        // own LiquidLayer entries in _liquids.
         Mesh _waterMesh;
         Material _waterMaterial;
         bool _dirty = true;
@@ -45,10 +64,41 @@ namespace CompoundSpheres
         Func<int, int, int> _sampleTexture;
         Func<float, float, float, Vector3> _projectPosition;
 
+        // Terrain-overlay callback (nullable; when unset terrain bakes base biome
+        // color only). Drives the TERRAIN-OVERLAY region below; independent of the
+        // liquid/water sub-mesh path so the two can be edited concurrently.
+        Func<int, int, TerrainOverlay> _sampleOverlay;
+
         // Water callbacks (nullable; when unset no water surface is emitted).
         Func<int, int, bool> _sampleIsWater;   // (tx,ty) => tile is open water
         Func<int, int, float> _sampleWaterLevel; // (tx,ty) => absolute water-surface height
         Func<int, int, float> _sampleSeabed;     // (tx,ty) => terrain floor under the water column
+
+        /// <summary>
+        /// A single non-water liquid surface (lava/swamp/acid). Mirrors the water
+        /// fields above but bundled per-kind so any number of liquids coexist. The
+        /// rebuild math is shared with water via <see cref="RebuildLiquidLayer"/>.
+        /// </summary>
+        sealed class LiquidLayer
+        {
+            public LiquidKind Kind;
+            public Mesh Mesh;
+            public Material Material;
+            public Func<int, int, bool> IsLiquid;
+            public Func<int, int, float> Level;
+            public Func<int, int, float> Seabed;
+            // Per-layer scratch (separate topology: only corners touching this liquid).
+            public Vector3[] Vertices;
+            public Vector3[] Normals;
+            public float[] CornerHeights;
+            public float[] Depth;
+            public Color32[] Colors;
+            public int[] Triangles;
+        }
+
+        // Extra liquid layers keyed by kind (Water stays in the dedicated fields above
+        // so the verified path is untouched). Lava/Swamp/Acid land here.
+        readonly Dictionary<LiquidKind, LiquidLayer> _liquids = new Dictionary<LiquidKind, LiquidLayer>();
 
         // Cached arrays to avoid GC churn on rebuild.
         Vector3[] _vertices;
@@ -191,6 +241,59 @@ namespace CompoundSpheres
         }
 
         /// <summary>
+        /// Generalized liquid-surface configuration. Each <see cref="LiquidKind"/> gets
+        /// its own corner-averaged sub-mesh at its own level, built with the IDENTICAL
+        /// corner-average + analytic-normal + depth-shading math as water. Water is
+        /// special-cased to the dedicated (verified) fields/mesh so it never regresses;
+        /// every other kind is stored in its own <see cref="LiquidLayer"/>.
+        /// </summary>
+        /// <param name="kind">Which liquid this surface represents.</param>
+        /// <param name="sampleIsLiquid">(tileX, tileY) => true if the tile is this liquid.</param>
+        /// <param name="sampleLevel">(tileX, tileY) => absolute liquid-surface height (world units).</param>
+        /// <param name="sampleSeabed">(tileX, tileY) => terrain floor height under the liquid column.</param>
+        public void ConfigureLiquid(
+            LiquidKind kind,
+            Func<int, int, bool> sampleIsLiquid,
+            Func<int, int, float> sampleLevel,
+            Func<int, int, float> sampleSeabed)
+        {
+            if (kind == LiquidKind.Water)
+            {
+                // Route water through the original dedicated path (no behavioural change).
+                ConfigureWater(sampleIsLiquid, sampleLevel, sampleSeabed);
+                return;
+            }
+
+            if (!_liquids.TryGetValue(kind, out var layer))
+            {
+                layer = new LiquidLayer
+                {
+                    Kind = kind,
+                    Mesh = new Mesh
+                    {
+                        name = "HeightField" + kind,
+                        indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
+                    },
+                };
+                _liquids[kind] = layer;
+            }
+            layer.IsLiquid = sampleIsLiquid;
+            layer.Level = sampleLevel;
+            layer.Seabed = sampleSeabed;
+            MarkDirty();
+        }
+
+        /// <summary>
+        /// Set the material for a non-water liquid layer. (Water uses
+        /// <see cref="SetWaterMaterial"/>.) The layer must have been configured first.
+        /// </summary>
+        public void SetLiquidMaterial(LiquidKind kind, Material mat)
+        {
+            if (kind == LiquidKind.Water) { _waterMaterial = mat; return; }
+            if (_liquids.TryGetValue(kind, out var layer)) layer.Material = mat;
+        }
+
+        /// <summary>
         /// Mark the mesh as needing a full rebuild (e.g. after tile type change).
         /// </summary>
         public void MarkDirty()
@@ -272,6 +375,16 @@ namespace CompoundSpheres
             if (_waterMesh != null && _waterMesh.vertexCount > 0 && _waterMaterial != null)
             {
                 Graphics.DrawMesh(_waterMesh, Matrix4x4.identity, _waterMaterial, 0);
+            }
+
+            // Draw the other liquid surfaces (lava/swamp/acid) the same way.
+            foreach (var kv in _liquids)
+            {
+                var layer = kv.Value;
+                if (layer.Mesh != null && layer.Mesh.vertexCount > 0 && layer.Material != null)
+                {
+                    Graphics.DrawMesh(layer.Mesh, Matrix4x4.identity, layer.Material, 0);
+                }
             }
         }
 
@@ -474,6 +587,156 @@ namespace CompoundSpheres
             _mesh.RecalculateBounds();
 
             RebuildWater(rowIndices, rowCount, cornerRows, cornerCols, wrapped);
+
+            // Rebuild every non-water liquid layer with the SAME corner-average +
+            // analytic-normal + depth-shading math (factored into RebuildLiquidMesh).
+            foreach (var kv in _liquids)
+            {
+                RebuildLiquidLayer(kv.Value, rowIndices, rowCount, cornerRows, cornerCols);
+            }
+        }
+
+        /// <summary>
+        /// Build one non-water liquid layer's sub-mesh. Identical algorithm to
+        /// <see cref="RebuildWater"/> (corner-averaged level over adjacent liquid tiles,
+        /// quads only where all 4 corners are liquid, depth baked into vertex color,
+        /// analytic normals from the level gradient) but operating on the layer's own
+        /// scratch arrays + callbacks.
+        /// </summary>
+        void RebuildLiquidLayer(LiquidLayer layer, int[] rowIndices, int rowCount, int cornerRows, int cornerCols)
+        {
+            if (layer.Mesh == null || layer.IsLiquid == null || layer.Level == null)
+            {
+                if (layer.Mesh != null) layer.Mesh.Clear();
+                return;
+            }
+
+            int vertCount = cornerRows * cornerCols;
+            int maxTri = rowCount * (cornerCols - 1) * 6;
+            if (layer.Vertices == null || layer.Vertices.Length < vertCount)
+            {
+                layer.Vertices = new Vector3[vertCount];
+                layer.Normals = new Vector3[vertCount];
+                layer.CornerHeights = new float[vertCount];
+                layer.Depth = new float[vertCount];
+                layer.Colors = new Color32[vertCount];
+            }
+            if (layer.Triangles == null || layer.Triangles.Length < maxTri)
+                layer.Triangles = new int[maxTri];
+
+            float maxDepth = 0.0001f;
+            for (int cr = 0; cr < cornerRows; cr++)
+            {
+                for (int cc = 0; cc < cornerCols; cc++)
+                {
+                    int vi = cr * cornerCols + cc;
+                    float lvlSum = 0f, depthSum = 0f;
+                    int liquidCount = 0;
+                    bool touchesLand = false;
+
+                    for (int dr = -1; dr <= 0; dr++)
+                    {
+                        int localRow = cr + dr;
+                        if (localRow < 0 || localRow >= rowCount) continue;
+                        int tileX = rowIndices[localRow];
+                        for (int dc = -1; dc <= 0; dc++)
+                        {
+                            int localCol = cc + dc;
+                            if (localCol < 0 || localCol >= _manager.Cols) continue;
+                            int tileY = localCol;
+                            if (layer.IsLiquid(tileX, tileY))
+                            {
+                                float lvl = layer.Level(tileX, tileY);
+                                float seabed = layer.Seabed != null ? layer.Seabed(tileX, tileY) : lvl;
+                                float depth = lvl - seabed;
+                                if (depth < 0f) depth = 0f;
+                                lvlSum += lvl;
+                                depthSum += depth;
+                                liquidCount++;
+                                if (depth > maxDepth) maxDepth = depth;
+                            }
+                            else touchesLand = true;
+                        }
+                    }
+
+                    if (liquidCount == 0)
+                    {
+                        layer.CornerHeights[vi] = float.NaN;
+                        layer.Colors[vi] = new Color32(0, 0, 0, 0);
+                        layer.Vertices[vi] = Vector3.zero;
+                        continue;
+                    }
+
+                    float avgLvl = lvlSum / liquidCount;
+                    layer.Depth[vi] = depthSum / liquidCount;
+
+                    float worldX;
+                    if (cr < rowCount) worldX = rowIndices[cr] - 0.5f;
+                    else if (cr > 0) worldX = rowIndices[cr - 1] + 0.5f;
+                    else worldX = rowIndices[0] - 0.5f;
+                    float worldY = cc - 0.5f;
+
+                    layer.Vertices[vi] = _projectPosition(worldX, worldY, avgLvl);
+                    layer.CornerHeights[vi] = avgLvl;
+                    layer.Colors[vi] = new Color32(0, (byte)(touchesLand ? 255 : 0), 0, 255);
+                }
+            }
+
+            // Bake normalized depth into R/B and translucency into A.
+            for (int vi = 0; vi < vertCount; vi++)
+            {
+                if (float.IsNaN(layer.CornerHeights[vi])) continue;
+                float frac = Mathf.Clamp01(layer.Depth[vi] / maxDepth);
+                byte f = (byte)(frac * 255f);
+                layer.Colors[vi] = new Color32(f, layer.Colors[vi].g, f, (byte)(140f + frac * 80f));
+            }
+
+            int ti = 0;
+            for (int r = 0; r < rowCount; r++)
+            {
+                for (int c = 0; c < cornerCols - 1; c++)
+                {
+                    int bl = r * cornerCols + c;
+                    int br = bl + 1;
+                    int tl = bl + cornerCols;
+                    int tr = tl + 1;
+                    if (float.IsNaN(layer.CornerHeights[bl]) || float.IsNaN(layer.CornerHeights[br]) ||
+                        float.IsNaN(layer.CornerHeights[tl]) || float.IsNaN(layer.CornerHeights[tr]))
+                        continue;
+                    layer.Triangles[ti++] = bl; layer.Triangles[ti++] = tl; layer.Triangles[ti++] = br;
+                    layer.Triangles[ti++] = br; layer.Triangles[ti++] = tl; layer.Triangles[ti++] = tr;
+                }
+            }
+
+            for (int cr = 0; cr < cornerRows; cr++)
+            {
+                int crM = cr > 0 ? cr - 1 : cr;
+                int crP = cr < cornerRows - 1 ? cr + 1 : cr;
+                for (int cc = 0; cc < cornerCols; cc++)
+                {
+                    int idx = cr * cornerCols + cc;
+                    if (float.IsNaN(layer.CornerHeights[idx])) { layer.Normals[idx] = Vector3.up; continue; }
+                    int ccM = cc > 0 ? cc - 1 : cc;
+                    int ccP = cc < cornerCols - 1 ? cc + 1 : cc;
+                    float hxP = Safe(layer.CornerHeights[crP * cornerCols + cc], layer.CornerHeights[idx]);
+                    float hxM = Safe(layer.CornerHeights[crM * cornerCols + cc], layer.CornerHeights[idx]);
+                    float hzP = Safe(layer.CornerHeights[cr * cornerCols + ccP], layer.CornerHeights[idx]);
+                    float hzM = Safe(layer.CornerHeights[cr * cornerCols + ccM], layer.CornerHeights[idx]);
+                    Vector3 tx = new Vector3(2f, hxP - hxM, 0f);
+                    Vector3 tz = new Vector3(0f, hzP - hzM, 2f);
+                    Vector3 n = Vector3.Cross(tx, tz).normalized;
+                    if (n.y < 0f) n = -n;
+                    layer.Normals[idx] = n;
+                }
+            }
+
+            layer.Mesh.Clear();
+            if (ti == 0) return;
+            layer.Mesh.vertices = SubArray(layer.Vertices, vertCount);
+            layer.Mesh.normals = SubArray(layer.Normals, vertCount);
+            layer.Mesh.colors32 = SubArray(layer.Colors, vertCount);
+            layer.Mesh.triangles = SubArray(layer.Triangles, ti);
+            layer.Mesh.RecalculateBounds();
         }
 
         /// <summary>
@@ -685,6 +948,11 @@ namespace CompoundSpheres
                 UnityEngine.Object.Destroy(_waterMesh);
                 _waterMesh = null;
             }
+            foreach (var kv in _liquids)
+            {
+                if (kv.Value.Mesh != null) UnityEngine.Object.Destroy(kv.Value.Mesh);
+            }
+            _liquids.Clear();
         }
     }
 }
