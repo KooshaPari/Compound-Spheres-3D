@@ -60,5 +60,18 @@ namespace CompoundSpheres.Tests
             Assert.Contains("public HeightFieldRenderer(IGridDimensions manager)", src);
             Assert.DoesNotContain("readonly SphereManager _manager;", src);
         }
+
+        // ---- Phase 1: GPU async creator ----
+        [Fact]
+        public void GpuCreator_exposes_async_wrapper()
+        {
+            var src = Read("Gpu/GpuSphereManager.cs");
+            Assert.Contains("public static IEnumerator CreateSphereManagerAsync(int rows, int cols, GpuSphereManagerSettings settings, Action<GpuSphereManager> onCreated", src);
+            // Heavy tile loop must yield across frames (matches CPU coroutine).
+            Assert.Contains("if (++count % chunkSize == 0)", src);
+            Assert.Contains("yield return null;", src);
+            // Manager handed back before the synchronous Begin().
+            Assert.Contains("onCreated?.Invoke(manager);", src);
+        }
     }
 }

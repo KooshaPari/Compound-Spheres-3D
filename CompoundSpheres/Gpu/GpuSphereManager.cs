@@ -298,6 +298,36 @@ namespace CompoundSpheres.Gpu
                 settings.Initiation?.Invoke(manager);
                 return manager;
             }
+
+            /// <summary>
+            /// Frame-yielding wrapper around <see cref="CreateSphereManager"/> mirroring
+            /// the CPU SphereManager.Creator.CreateSphereManagerAsync coroutine pattern
+            /// (issue #199 Phase 1). The heavy per-tile build loop yields every
+            /// <paramref name="chunkSize"/> tiles to avoid a single-frame spike; the
+            /// manager is handed back via <paramref name="onCreated"/> before the
+            /// synchronous Begin() so callers can store the reference immediately.
+            /// </summary>
+            public static IEnumerator CreateSphereManagerAsync(int rows, int cols, GpuSphereManagerSettings settings, Action<GpuSphereManager> onCreated, int chunkSize = 4096, string Name = "GpuSphereManager")
+            {
+                if (cols <= 0 || rows <= 0)
+                    throw new ArgumentException("Cols And Rows must be above 0 when creating a sphere manager");
+                GameObject go = new GameObject(Name);
+                GpuSphereManager manager = go.AddComponent<GpuSphereManager>().Init(rows, cols, settings);
+                int count = 0;
+                for (int X = 0; X < rows; X++)
+                {
+                    GpuSphereRow row = manager.SphereRows[X] = new GpuSphereRow(manager, X);
+                    for (int Y = 0; Y < cols; Y++)
+                    {
+                        manager.Tiles[(X * cols) + Y] = new GpuSphereTile(X, Y, row);
+                        if (++count % chunkSize == 0)
+                            yield return null;
+                    }
+                }
+                onCreated?.Invoke(manager);
+                manager.Begin();
+                settings.Initiation?.Invoke(manager);
+            }
         }
     }
 
