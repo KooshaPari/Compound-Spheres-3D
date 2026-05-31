@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace CompoundSpheres
@@ -56,6 +57,12 @@ namespace CompoundSpheres
         const float QuietMs = 0.20f;      // seconds — wait 200ms after last dirty
         const float MaxStallMs = 0.50f;   // seconds — force rebuild after 500ms of continuous dirty
         const float MinIntervalMs = 0.10f; // seconds — minimum 100ms between rebuilds
+
+        // PERF: when set by the consumer (gated behind SavedSettings.ProfilerDump so
+        // it never spams the WorldBox debug-console overlay), each full Rebuild logs
+        // a Stopwatch breakdown of the corner-bake / triangle / normal passes. Off by
+        // default — per-frame logging is the documented overlay-spam trap.
+        public static bool ProfileRebuild = false;
 
         // Callbacks to retrieve per-tile height and color without coupling
         // CompoundSpheres to WorldSphereMod types. Set by the consumer.
@@ -559,9 +566,18 @@ namespace CompoundSpheres
 
             EnsureArrays(vertCount, triCount);
 
+            var sw = ProfileRebuild ? System.Diagnostics.Stopwatch.StartNew() : null;
+
             // Build vertices: for each corner, average the heights & colors of
-            // the up-to-4 tiles that share it.
-            for (int cr = 0; cr < cornerRows; cr++)
+            // the up-to-4 tiles that share it. PARALLELIZED over corner ROWS:
+            // each iteration writes ONLY vertex indices in its own row
+            // (vi = cr*cornerCols+cc), so rows never collide and the per-corner
+            // work (sampleHeight/Color/Texture callbacks + averaging) is the
+            // single biggest cost in the rebuild. On an 8-core box this drops the
+            // O(corners*4) main-thread bake by ~Ncores. The sample callbacks must
+            // be pure reads of already-committed tile data (true here: RefreshSphere
+            // drains all dirty queues BEFORE MarkDirty, so no tile mutation races).
+            Parallel.For(0, cornerRows, cr =>
             {
                 for (int cc = 0; cc < cornerCols; cc++)
                 {
@@ -680,7 +696,9 @@ namespace CompoundSpheres
                         (float)cc / cols,
                         (float)cr / rowCount);
                 }
-            }
+            });
+
+            long bakeMs = sw?.ElapsedMilliseconds ?? 0;
 
             // Build triangles: two tris per quad.
             int ti = 0;
@@ -709,7 +727,11 @@ namespace CompoundSpheres
             // cross product. This gives smooth per-vertex lighting on slopes
             // instead of the flat-shaded-per-triangle look RecalculateNormals
             // produces on a low-poly height field.
-            for (int cr = 0; cr < cornerRows; cr++)
+            long triMs = sw?.ElapsedMilliseconds ?? 0;
+
+            // Normals are also per-corner-row independent: each iteration reads
+            // _cornerHeights (now fully populated) and writes only _normals[cr*..].
+            Parallel.For(0, cornerRows, cr =>
             {
                 int crM = cr > 0 ? cr - 1 : cr;
                 int crP = cr < cornerRows - 1 ? cr + 1 : cr;
@@ -729,7 +751,9 @@ namespace CompoundSpheres
                     if (n.y < 0f) n = -n;
                     _normals[cr * cornerCols + cc] = n;
                 }
-            }
+            });
+
+            long normMs = sw?.ElapsedMilliseconds ?? 0;
 
             _mesh.Clear();
             _mesh.vertices = SubArray(_vertices, vertCount);
@@ -738,6 +762,15 @@ namespace CompoundSpheres
             _mesh.uv = SubArray(_uvs, vertCount);
             _mesh.triangles = SubArray(_triangles, triCount);
             _mesh.RecalculateBounds();
+
+            if (sw != null)
+            {
+                sw.Stop();
+                long uploadMs = sw.ElapsedMilliseconds;
+                Debug.LogWarning($"[WSM3D][PERF] HeightField.Rebuild {uploadMs}ms " +
+                    $"(bake={bakeMs}ms tri={triMs - bakeMs}ms norm={normMs - triMs}ms " +
+                    $"upload={uploadMs - normMs}ms verts={vertCount} tris={triCount / 3})");
+            }
 
             RebuildWater(rowIndices, rowCount, cornerRows, cornerCols, wrapped);
 
