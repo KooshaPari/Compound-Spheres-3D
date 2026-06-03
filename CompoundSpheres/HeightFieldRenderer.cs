@@ -1011,10 +1011,11 @@ namespace CompoundSpheres
         /// A corner emits a water vertex iff any of its up-to-4 adjacent tiles is
         /// water; quads are emitted only when all 4 of their corners are water (so
         /// the surface stops at the shore rather than overshooting onto land).
-        /// Corner height = averaged sampleWaterLevel over its adjacent water tiles,
-        /// so the surface conforms to basins and sits below the shore. Depth =
-        /// waterLevel - seabed is baked into vertex color (R/B = depth fraction,
-        /// G = shore flag) reusing the scheme the old overlay proved.
+        /// Corner height uses a single sampled water level (flat across the ocean),
+        /// so the water surface is not pulled down by nearby seabed elevation.
+        /// Depth = waterLevel - seabed is baked into vertex color (R/B =
+        /// depth fraction, G = shore flag) reusing the scheme the old overlay
+        /// proved.
         /// </summary>
         void RebuildWater(int[] rowIndices, int rowCount, int cornerRows, int cornerCols, bool wrapped)
         {
@@ -1028,16 +1029,18 @@ namespace CompoundSpheres
             int maxTri = rowCount * (cornerCols - 1) * 6;
             EnsureWaterArrays(vertCount, maxTri);
 
-            // First pass: per corner, average water level + depth over adjacent
-            // WATER tiles only; flag shore corners (touch a non-water tile).
+            // First pass: find a constant water level for the rebuild (from the
+            // first seen water tile) and average depth over adjacent water tiles
+            // only; flag shore corners (touch a non-water tile).
             // -1 marks a corner with no adjacent water (not part of the surface).
             float maxDepth = 0.0001f;
+            float constantWaterLevel = float.NaN;
             for (int cr = 0; cr < cornerRows; cr++)
             {
                 for (int cc = 0; cc < cornerCols; cc++)
                 {
                     int vi = cr * cornerCols + cc;
-                    float wlSum = 0f, depthSum = 0f;
+                    float depthSum = 0f;
                     int waterCount = 0;
                     bool touchesLand = false;
 
@@ -1054,11 +1057,14 @@ namespace CompoundSpheres
 
                             if (_sampleIsWater(tileX, tileY))
                             {
-                                float wl = _sampleWaterLevel(tileX, tileY);
-                                float seabed = _sampleSeabed != null ? _sampleSeabed(tileX, tileY) : wl;
-                                float depth = wl - seabed;
+                                float sampledLevel = _sampleWaterLevel(tileX, tileY);
+                                if (float.IsNaN(constantWaterLevel))
+                                {
+                                    constantWaterLevel = sampledLevel;
+                                }
+                                float seabed = _sampleSeabed != null ? _sampleSeabed(tileX, tileY) : sampledLevel;
+                                float depth = sampledLevel - seabed;
                                 if (depth < 0f) depth = 0f;
-                                wlSum += wl;
                                 depthSum += depth;
                                 waterCount++;
                                 if (depth > maxDepth) maxDepth = depth;
@@ -1078,7 +1084,12 @@ namespace CompoundSpheres
                         continue;
                     }
 
-                    float avgWl = wlSum / waterCount;
+                    if (float.IsNaN(constantWaterLevel))
+                    {
+                        continue;
+                    }
+
+                    float wl = constantWaterLevel;
                     _wDepth[vi] = depthSum / waterCount;
 
                     float worldX;
@@ -1087,8 +1098,8 @@ namespace CompoundSpheres
                     else worldX = rowIndices[0] - 0.5f;
                     float worldY = cc - 0.5f;
 
-                    _wVertices[vi] = _projectPosition(worldX, worldY, avgWl);
-                    _wCornerHeights[vi] = avgWl;
+                    _wVertices[vi] = _projectPosition(worldX, worldY, wl);
+                    _wCornerHeights[vi] = wl;
                     // Stash shore flag in G; R/B/A finalized once maxDepth is known.
                     _wColors[vi] = new Color32(0, (byte)(touchesLand ? 255 : 0), 0, 255);
                     _uvs[vi] = new Vector2((float)cc / Mathf.Max(1, _manager.Cols), (float)cr / Mathf.Max(1, rowCount));
