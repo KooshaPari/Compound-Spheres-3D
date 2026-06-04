@@ -548,14 +548,10 @@ namespace CompoundSpheres
                 _lastRebuildTime = Time.realtimeSinceStartup;
             }
 
-            if (_material == null)
+            Material terrainMaterial = EnsureTerrainMaterial();
+            if (_mesh.vertexCount > 0 && terrainMaterial != null)
             {
-                _material = _manager.Material;
-            }
-
-            if (_mesh.vertexCount > 0 && _material != null)
-            {
-                Graphics.DrawMesh(_mesh, Matrix4x4.identity, _material, 0);
+                Graphics.DrawMesh(_mesh, Matrix4x4.identity, terrainMaterial, 0);
             }
 
             // Draw the water sub-mesh on top (translucent, queued after opaque land).
@@ -581,6 +577,53 @@ namespace CompoundSpheres
         public void SetMaterial(Material mat)
         {
             _material = mat;
+            if (_material == null)
+            {
+                _material = EnsureTerrainMaterial();
+            }
+        }
+
+        Material EnsureTerrainMaterial()
+        {
+            if (_material != null)
+            {
+                return _material;
+            }
+
+            if (_manager != null && _manager.Material != null)
+            {
+                _material = _manager.Material;
+                return _material;
+            }
+
+            Shader shader = Shader.Find("WSM3D/OpaqueVertexColor");
+            if (shader == null)
+            {
+                shader = Shader.Find("Sprites/Default");
+            }
+
+            if (shader == null)
+            {
+                Debug.LogWarning("[WSM3D] HeightFieldRenderer: no terrain shader resolved.");
+                return null;
+            }
+
+            _material = new Material(shader)
+            {
+                name = "WSM3D.HeightFieldTerrain",
+                color = Color.white,
+            };
+
+            if (_material.HasProperty("_MainTex"))
+            {
+                _material.SetTexture("_MainTex", Texture2D.whiteTexture);
+            }
+            if (_material.HasProperty("_BaseMap"))
+            {
+                _material.SetTexture("_BaseMap", Texture2D.whiteTexture);
+            }
+
+            return _material;
         }
 
         void Rebuild(int cameraX, int minRow, int maxRow, bool wrapped)
