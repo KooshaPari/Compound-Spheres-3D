@@ -495,6 +495,7 @@ namespace CompoundSpheres
             // — the GPU clips off-screen geometry trivially. The mesh now spans
             // the full world; we ignore minRow/maxRow except on first build.
             int rows = _manager.Rows;
+            int dirtyCount = _manager.HasDirtyHeights ? _manager.SnapshotDirtyHeights().Length : 0;
             int fullMin = 0;
             int fullMax = rows;
 
@@ -532,6 +533,32 @@ namespace CompoundSpheres
                     _lastRebuildReason = settled
                         ? (brushQuiet ? "steady-quiet" : "steady-stall")
                         : (brushQuiet ? "settle-quiet" : "settle-stall");
+                }
+            }
+
+            // INCREMENTAL-FIRST (2026-06-04 perf fix): the debounce above can set
+            // shouldRebuild=true on a steady-state timer even when only a FEW tiles are
+            // dirty — that forced a full 256² Rebuild (~3s "HEIGHTFIELD SLOW") every ~2s on
+            // a living world, reading as a periodic freeze + card/billboard flash. Prefer the
+            // incremental per-tile update whenever the dirty set is small, EVEN IF the debounce
+            // wanted a full rebuild. Only fall through to full Rebuild when a large fraction
+            // (>=25%) changed or the incremental apply fails.
+            if (_dirty && dirtyCount > 0 && !isFirstBuild)
+            {
+                int rebuildThreshold = Mathf.Max(1, Mathf.CeilToInt(_manager.TotalTiles * 0.25f));
+                if (dirtyCount < rebuildThreshold
+                    && TryApplyDirtyHeights(_manager.SnapshotDirtyHeights(), wrapped))
+                {
+                    shouldRebuild = false; // incremental handled it — skip the full rebuild
+                    _dirty = false;
+                    _lastDirtyTime = -1f;
+                    _lastRebuildTime = Time.realtimeSinceStartup;
+                    PushHeightsToGpu();
+                }
+                else if (dirtyCount >= rebuildThreshold)
+                {
+                    shouldRebuild = true;
+                    _lastRebuildReason = $"dirty-threshold({dirtyCount}/{_manager.TotalTiles})";
                 }
             }
 
@@ -581,6 +608,181 @@ namespace CompoundSpheres
             {
                 _material = EnsureTerrainMaterial();
             }
+        }
+
+        bool TryApplyDirtyHeights(int[] dirtyTileIndices, bool wrapped)
+        {
+            if (dirtyTileIndices == null || dirtyTileIndices.Length == 0)
+            {
+                return false;
+            }
+
+            int rows = _manager.Rows;
+            int cols = _manager.Cols;
+            int cornerRows = rows + 1;
+            int cornerCols = cols + 1;
+            int vertCount = cornerRows * cornerCols;
+            EnsureArrays(vertCount, rows * cols * 6);
+
+            var dirtyCorners = new HashSet<int>();
+            foreach (int tileIndex in dirtyTileIndices)
+            {
+                int tileX = tileIndex / cols;
+                int tileY = tileIndex % cols;
+
+                for (int dx = 0; dx <= 1; dx++)
+                {
+                    int cr = tileX + dx;
+                    if (cr < 0 || cr >= cornerRows) continue;
+                    for (int dy = 0; dy <= 1; dy++)
+                    {
+                        int cc = tileY + dy;
+                        if (cc < 0 || cc >= cornerCols) continue;
+                        dirtyCorners.Add((cr * cornerCols) + cc);
+                    }
+                }
+            }
+
+            if (dirtyCorners.Count == 0)
+            {
+                return false;
+            }
+
+            foreach (int cornerIndex in dirtyCorners)
+            {
+                int cr = cornerIndex / cornerCols;
+                int cc = cornerIndex % cornerCols;
+                RecalculateCorner(cr, cc, rows, cols, cornerRows, cornerCols, wrapped);
+            }
+
+            var dirtyNormals = new HashSet<int>();
+            foreach (int cornerIndex in dirtyCorners)
+            {
+                int cr = cornerIndex / cornerCols;
+                int cc = cornerIndex % cornerCols;
+                for (int dr = -1; dr <= 1; dr++)
+                {
+                    int nr = cr + dr;
+                    if (nr < 0 || nr >= cornerRows) continue;
+                    for (int dc = -1; dc <= 1; dc++)
+                    {
+                        int nc = cc + dc;
+                        if (nc < 0 || nc >= cornerCols) continue;
+                        dirtyNormals.Add((nr * cornerCols) + nc);
+                    }
+                }
+            }
+
+            foreach (int normalIndex in dirtyNormals)
+            {
+                int cr = normalIndex / cornerCols;
+                int cc = normalIndex % cornerCols;
+                RecalculateNormal(cr, cc, cornerRows, cornerCols);
+            }
+
+            const UnityEngine.Rendering.MeshUpdateFlags NoRecalc =
+                UnityEngine.Rendering.MeshUpdateFlags.DontRecalculateBounds |
+                UnityEngine.Rendering.MeshUpdateFlags.DontValidateIndices;
+
+            _mesh.SetVertices(_vertices, 0, vertCount, NoRecalc);
+            _mesh.SetNormals(_normals, 0, vertCount, NoRecalc);
+            _mesh.SetColors(_colors, 0, vertCount, NoRecalc);
+            _mesh.SetUVs(0, _uvs, 0, vertCount);
+            _mesh.RecalculateBounds();
+            return true;
+        }
+
+        void RecalculateCorner(int cr, int cc, int rows, int cols, int cornerRows, int cornerCols, bool wrapped)
+        {
+            float hSum = 0f;
+            int rSum = 0, gSum = 0, bSum = 0;
+            int count = 0;
+            int dominantTex = 0;
+            float maxContrib = -1f;
+            TerrainOverlay ovAccum = default;
+            int ovCount = 0;
+
+            for (int dr = -1; dr <= 0; dr++)
+            {
+                int localRow = cr + dr;
+                if (localRow < 0 || localRow >= rows) continue;
+                int tileX = localRow;
+
+                for (int dc = -1; dc <= 0; dc++)
+                {
+                    int localCol = cc + dc;
+                    if (localCol < 0 || localCol >= cols) continue;
+                    int tileY = localCol;
+
+                    float h = _sampleHeight(tileX, tileY);
+                    Color32 c = _sampleColor(tileX, tileY);
+                    hSum += h;
+                    rSum += c.r;
+                    gSum += c.g;
+                    bSum += c.b;
+                    count++;
+
+                    if (_sampleOverlay != null)
+                    {
+                        ovAccum.Accumulate(_sampleOverlay(tileX, tileY));
+                        ovCount++;
+                    }
+
+                    if (h > maxContrib)
+                    {
+                        maxContrib = h;
+                        dominantTex = _sampleTexture(tileX, tileY);
+                    }
+                }
+            }
+
+            if (count == 0) count = 1;
+            float avgH = hSum / count;
+            float noise = Mathf.PerlinNoise(cc * 0.1f, cr * 0.1f);
+            avgH += (noise - 0.5f) * 0.3f;
+            float worldX;
+            if (cr < rows)
+            {
+                worldX = cr - 0.5f;
+            }
+            else if (cr > 0)
+            {
+                worldX = (cr - 1) + 0.5f;
+            }
+            else
+            {
+                worldX = -0.5f;
+            }
+
+            float worldY = cc - 0.5f;
+            int vi = cr * cornerCols + cc;
+            _vertices[vi] = _projectPosition(worldX, worldY, avgH);
+            _cornerHeights[vi] = avgH;
+            Color32 baseColor = new Color32((byte)(rSum / count), (byte)(gSum / count), (byte)(bSum / count), 255);
+            if (ovCount > 0)
+            {
+                ovAccum.Normalize(ovCount);
+                baseColor = ApplyTerrainOverlay(baseColor, ovAccum, avgH);
+            }
+            _colors[vi] = baseColor;
+            _uvs[vi] = new Vector2((float)cc / cols, (float)cr / rows);
+        }
+
+        void RecalculateNormal(int cr, int cc, int cornerRows, int cornerCols)
+        {
+            int crM = cr > 0 ? cr - 1 : cr;
+            int crP = cr < cornerRows - 1 ? cr + 1 : cr;
+            int ccM = cc > 0 ? cc - 1 : cc;
+            int ccP = cc < cornerCols - 1 ? cc + 1 : cc;
+            float hxPlus = _cornerHeights[crP * cornerCols + cc];
+            float hxMinus = _cornerHeights[crM * cornerCols + cc];
+            float hzPlus = _cornerHeights[cr * cornerCols + ccP];
+            float hzMinus = _cornerHeights[cr * cornerCols + ccM];
+            Vector3 tx = new Vector3(2f, hxPlus - hxMinus, 0f);
+            Vector3 tz = new Vector3(0f, hzPlus - hzMinus, 2f);
+            Vector3 n = Vector3.Cross(tx, tz).normalized;
+            if (n.y < 0f) n = -n;
+            _normals[cr * cornerCols + cc] = n;
         }
 
         Material EnsureTerrainMaterial()

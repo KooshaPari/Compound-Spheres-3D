@@ -396,6 +396,22 @@ namespace CompoundSpheres
             return Scales.UpdateBuffer(_scales, (int i) => SphereTiles[i].UpdateScale(), TotalTiles, maxPerFrame);
         }
         /// <summary>
+        /// Snapshot the current dirty scale indices before the queue is drained.
+        /// HeightFieldRenderer uses this to patch only the affected vertices when
+        /// the dirty set is small, instead of forcing a full 256x256 mesh rebuild.
+        /// </summary>
+        public int[] SnapshotDirtyHeights()
+        {
+            if (_scales == null || _scales.Count == 0)
+            {
+                return Array.Empty<int>();
+            }
+
+            int[] snapshot = new int[_scales.Count];
+            _scales.CopyTo(snapshot);
+            return snapshot;
+        }
+        /// <summary>
         /// refresh the color buffer, processing at most maxPerFrame dirty entries.
         /// Returns true when all entries are processed.
         /// </summary>
