@@ -28,7 +28,7 @@ namespace CompoundSpheres
 
     public class HeightFieldRenderer
     {
-        readonly SphereManager _manager;
+        readonly IGridDimensions _manager;
         Mesh _mesh;
         Material _material;
         // Liquid surfaces live in the fork as ADDITIONAL corner-averaged sub-meshes built
@@ -198,7 +198,7 @@ namespace CompoundSpheres
             });
         }
 
-        public HeightFieldRenderer(SphereManager manager)
+        public HeightFieldRenderer(IGridDimensions manager)
         {
             _manager = manager ?? throw new ArgumentNullException(nameof(manager));
             _mesh = new Mesh

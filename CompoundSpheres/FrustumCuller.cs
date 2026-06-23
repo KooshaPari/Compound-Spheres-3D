@@ -141,9 +141,10 @@ namespace CompoundSpheres
                 int cStart = c * ChunkSize;
                 int cEnd = Math.Min(cStart + ChunkSize - 1, cols - 1);
 
-                // Recompute world pos from grid (X=rowIndex, Y=col) + Radius.
-                Vector3 first = CompoundSpheres.Gpu.GpuDefaults.CartesianToCylindrical(manager, rowIndex, cStart);
-                Vector3 last = CompoundSpheres.Gpu.GpuDefaults.CartesianToCylindrical(manager, rowIndex, cEnd);
+                // Recompute world pos from grid (X=rowIndex, Y=col) for the
+                // manager's active shape (cylindrical / flat / cube).
+                Vector3 first = CompoundSpheres.Gpu.GpuDefaults.TileWorldPosition(manager, rowIndex, cStart);
+                Vector3 last = CompoundSpheres.Gpu.GpuDefaults.TileWorldPosition(manager, rowIndex, cEnd);
                 Bounds chunkBounds = BoundsFromTileRange(first, last, tileHalfSize);
 
                 if (GeometryUtility.TestPlanesAABB(_frustumPlanes, chunkBounds))

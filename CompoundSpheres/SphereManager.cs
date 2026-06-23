@@ -11,7 +11,7 @@ namespace CompoundSpheres
     /// <summary>
     /// The Manager For Your Compound Sphere
     /// </summary>
-    public class SphereManager : MonoBehaviour, IEnumerable
+    public class SphereManager : MonoBehaviour, IEnumerable, IGridDimensions
     {
         /// <summary>
         /// a spheretile at x and y coordinates

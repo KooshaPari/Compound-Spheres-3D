@@ -3,3 +3,5 @@
 /CompoundSpheres/obj
 /.idea
 CompoundSpheres.sln.DotSettings.user
+**/bin/
+**/obj/
