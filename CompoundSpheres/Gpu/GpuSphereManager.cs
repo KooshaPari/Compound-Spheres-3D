@@ -136,6 +136,26 @@ namespace CompoundSpheres.Gpu
         public float Radius { private set; get; }
         public float Diameter => 2 * Radius;
         public override int RowCount => Rows;
+        /// <summary>
+        /// IGridDimensions: total tile count on the GPU grid. The renderer
+        /// uses this for full-rebuild budget sizing when incremental rebuilds
+        /// are not available.
+        /// </summary>
+        public override int TotalTiles => Rows * Cols;
+        /// <summary>
+        /// IGridDimensions: GPU path keeps all tile scales in a structured
+        /// buffer managed by compute kernels; we don't maintain a CPU dirty
+        /// queue, so incremental rebuilds are not (yet) supported. Returning
+        /// false forces the heightfield renderer down its full-rebuild path
+        /// for the GPU actor/voxel pipeline.
+        /// </summary>
+        public bool HasDirtyHeights => false;
+        /// <summary>
+        /// IGridDimensions: see <see cref="HasDirtyHeights"/>. Returns an
+        /// empty array — the GPU path rebuilds the whole heightfield when
+        /// anything changes.
+        /// </summary>
+        public int[] SnapshotDirtyHeights() => System.Array.Empty<int>();
         protected override float RadiusForCompute => Radius;
 
         internal GraphicsBuffer CommandBuf;

@@ -13,5 +13,13 @@ namespace CompoundSpheres
         int Cols { get; }
         UnityEngine.Material Material { get; }
         UnityEngine.Vector3 SphereTilePosition(float X, float Y, float Height);
+
+        // Incremental-heightfield (2026-06-04 perf fix). The HeightFieldRenderer asks
+        // the manager which tiles have height-dirty state so it can prefer a per-tile
+        // incremental mesh update over a full 256² rebuild when only a small set
+        // changed. Implementations return false / empty to force a full rebuild.
+        bool HasDirtyHeights { get; }
+        int[] SnapshotDirtyHeights();
+        int TotalTiles { get; }
     }
 }
