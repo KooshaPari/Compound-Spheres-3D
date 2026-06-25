@@ -400,7 +400,48 @@ namespace CompoundSpheres
                     indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
                 };
             }
+
+            // ADR-0013: ensure water renders in the Transparent queue (renderQueue=3000),
+            // tag it as Queue=Transparent (override any shader Tag), disable depth writes
+            // (depth-test still on so terrain reads through), and use the Unity Standard
+            // shader fallback if no custom water material has been provided.
+            if (_waterMaterial == null)
+            {
+                var sh = Shader.Find("Standard");
+                if (sh != null)
+                {
+                    _waterMaterial = new Material(sh) { name = "HeightFieldWater_DefaultStandard" };
+                }
+            }
+            if (_waterMaterial != null)
+            {
+                EnsureMaterial(_waterMaterial);
+            }
+
             MarkDirty();
+        }
+
+        /// <summary>
+        /// Configure a water material for transparent rendering: alpha-blend, no
+        /// depth-write, Queue=Transparent (3000), Queue tag override so any shader
+        /// Tag {"Queue"="..."} is bypassed. Used by <see cref="ConfigureWater"/> when
+        /// no explicit material was set via <see cref="SetWaterMaterial"/>.
+        /// </summary>
+        public static void EnsureMaterial(Material mat)
+        {
+            if (mat == null) return;
+            mat.renderQueue = 3000;
+            mat.SetOverrideTag("Queue", "Transparent");
+            mat.SetInt("_ZWrite", 0);
+            mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+            // ADR-0013: enable Standard-shader alpha blend keyword so the
+            // material renders as transparent regardless of which shader variant
+            // was picked. Without _ALPHABLEND_ON, SetOverrideTag alone won't
+            // flip Standard into transparent mode.
+            mat.EnableKeyword("_ALPHABLEND_ON");
+            mat.DisableKeyword("_ALPHATEST_ON");
+            mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
         }
 
         /// <summary>
@@ -410,6 +451,9 @@ namespace CompoundSpheres
         public void SetWaterMaterial(Material mat)
         {
             _waterMaterial = mat;
+            // ADR-0013: every water material must be transparent-queue tagged.
+            // Apply the canonical transparent config regardless of caller.
+            EnsureMaterial(mat);
         }
 
         /// <summary>
