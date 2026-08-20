@@ -1,0 +1,41 @@
+name: nightly
+
+# Scheduled regression check: runs daily at 06:00 UTC + manual dispatch.
+# Builds the library and runs all tests.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  nightly-regression:
+    name: Build + Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore CompoundMeshes.sln
+
+      - name: Build
+        run: dotnet build CompoundMeshes.sln -c Release --no-restore
+
+      - name: Test
+        run: dotnet test Tests/CompoundMeshes.Tests/ -c Release --no-build --verbosity normal
+
+      - name: Format check
+        run: dotnet format CompoundMeshes.sln --verify-no-changes --no-restore

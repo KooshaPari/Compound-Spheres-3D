@@ -1,0 +1,40 @@
+{
+  "name": "Compound-Spheres-3D dev",
+  "image": "mcr.microsoft.com/devcontainers/dotnet:8.0",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-dotnettools.csharp",
+        "ms-dotnettools.csdevkit",
+        "ms-vscode.powershell",
+        "redhat.vscode-yaml",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "files.eol": "\n",
+        "files.insertFinalNewline": true,
+        "files.trimTrailingWhitespace": true,
+        "dotnet.defaultSolution": "CompoundMeshes.sln",
+        "omnisharp.enableEditorConfigSupport": true,
+        "omnisharp.enableRoslynAnalyzers": true,
+        "editor.formatOnSave": false
+      }
+    }
+  },
+  "forwardPorts": [],
+  "workspaceFolder": "/workspaces/Compound-Spheres-3D",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/Compound-Spheres-3D,type=bind,consistency=cached",
+  "remoteEnv": {
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_NOLOGO": "1",
+    "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1"
+  },
+  "postCreateCommand": "dotnet restore CompoundMeshes.sln || true",
+  "remoteUser": "vscode"
+}

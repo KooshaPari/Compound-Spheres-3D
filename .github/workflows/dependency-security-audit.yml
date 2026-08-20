@@ -1,0 +1,49 @@
+name: dependency-security-audit
+
+# NuGet dependency security audit for Compound-Spheres-3D.
+# Blocks on any vulnerable packages found by `dotnet list package`.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/dependency-security-audit.yml"
+      - "**/*.csproj"
+      - "**/packages.lock.json"
+      - "**/Directory.Packages.props"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/dependency-security-audit.yml"
+      - "**/*.csproj"
+      - "**/packages.lock.json"
+      - "**/Directory.Packages.props"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nuget-audit:
+    name: NuGet dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore packages
+        run: dotnet restore CompoundMeshes.sln
+
+      - name: Audit NuGet packages for vulnerabilities
+        run: |
+          echo "::group::dotnet list package --vulnerable"
+          dotnet list package --vulnerable --include-transitive
+          VULN_COUNT=$(dotnet list package --vulnerable --include-transitive 2>&1 | grep -c "has the following vulnerable packages" || true)
+          echo "::endgroup::"
+          if [ "$VULN_COUNT" -gt 0 ]; then
+            echo "::error::Found vulnerable NuGet packages. Run 'dotnet list package --vulnerable' locally."
+            exit 1
+          fi
+          echo "No vulnerable NuGet packages found."
