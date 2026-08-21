@@ -1,7 +1,9 @@
 # =============================================================================
-# Compound-Spheres-3D — CI Dockerfile
+# Compound-Spheres-3D — Podman / OCI Containerfile
 # =============================================================================
 # Multi-stage image for CI builds and SBOM generation.
+# Use:  podman build -t compound-spheres-ci .
+#       podman run --rm compound-spheres-ci
 #
 # Builds CompoundMeshes.sln in Release mode.
 # Test projects (net8.0 xunit) run as part of the CI pipeline.
